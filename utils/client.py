@@ -53,7 +53,14 @@ class Client:
         else:
             self._logger.debug(f"{indent}{data}")
 
-    def _request(self, method: Literal["GET", "POST"], url: str, **kwargs) -> Response:
+    def _request(
+        self,
+        method: Literal["GET", "POST"],
+        url: str,
+        max_attempts: int = 3,
+        retry_delay: float = 0.5,
+        **kwargs,
+    ) -> Response:
         self._logger.debug(f"Sending request: {method} {url}")
 
         for key, value in kwargs.items():
@@ -65,9 +72,6 @@ class Client:
                 elif not (key == "allow_redirects" and value is True):
                     self._logger.debug(f"  {key}: {value}")
         self._logger.breathe()
-
-        max_attempts = 3
-        retry_delay = 0.5
 
         for attempt in range(1, max_attempts + 1):
             try:
@@ -188,9 +192,14 @@ class EpeClient(Client):
         # 可能会 raise Exception，保持 message 让父过程 catch
 
         try:
-            resp_json: dict = resp.json()
+            resp_json = resp.json()
         except Exception as e:
             raise Exception(f"Failed to parse response as JSON: {e}")
+
+        if not isinstance(resp_json, dict):
+            raise Exception(
+                f"Expected response JSON object, got {type(resp_json).__name__}"
+            )
 
         code = resp_json.get("code")
         message = resp_json.get("message", "")

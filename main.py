@@ -17,6 +17,7 @@ from utils.encrypt import (
 )
 from utils.recognize import Recognizer
 from utils.notify import Notifier
+from utils.orders import extract_order_info, recover_unpaid_order
 from utils.time import get_next_weekday, get_release_time, wait_until
 from utils.config import LOGS_DIR, LOG_FILE, CONFIG
 
@@ -372,46 +373,94 @@ def main(
                     time.sleep(1 - elapsed)
 
                 # Submit reservation order
-                submit_data = client.epe_post(
-                    "https://epe.pku.edu.cn/venue-server/api/reservation/order/submit",
-                    data={
-                        "captchaVerification": encrypt_aes_ecb(
-                            captcha_token + "---" + recognized_points,
-                            captcha_secret_key,
-                        ),
-                        "captchaToken": captcha_token,
-                        "reservationOrderJson": json.dumps(
-                            [
-                                {"spaceId": trade["spaceId"], "timeId": trade["timeId"]}
-                                for trade in selected_trades
-                            ],
-                            separators=(",", ":"),
-                        ),
-                        "reservationDate": target_date,
-                        "weekStartDate": target_date,
-                        "reservationType": "-1",
-                        "orderPrice": total_fee,
-                        "orderPin": generate_order_pin(),
-                        "venueSiteId": venue,
-                        "phone": CONFIG["epe"]["phone"],
-                    },
-                )
+                try:
+                    submit_data = client.epe_post(
+                        "https://epe.pku.edu.cn/venue-server/api/reservation/order/submit",
+                        data={
+                            "captchaVerification": encrypt_aes_ecb(
+                                captcha_token + "---" + recognized_points,
+                                captcha_secret_key,
+                            ),
+                            "captchaToken": captcha_token,
+                            "reservationOrderJson": json.dumps(
+                                [
+                                    {
+                                        "spaceId": trade["spaceId"],
+                                        "timeId": trade["timeId"],
+                                    }
+                                    for trade in selected_trades
+                                ],
+                                separators=(",", ":"),
+                            ),
+                            "reservationDate": target_date,
+                            "weekStartDate": target_date,
+                            "reservationType": "-1",
+                            "orderPrice": total_fee,
+                            "orderPin": generate_order_pin(),
+                            "venueSiteId": venue,
+                            "phone": CONFIG["epe"]["phone"],
+                        },
+                        # Retrying a timed-out submit can create a duplicate order.
+                        max_attempts=1,
+                    )
+                    order_info = extract_order_info(submit_data)
 
-                trade_id = submit_data.get("id")
-                trade_no = submit_data.get("tradeNo")
+                except Exception as submit_error:
+                    logger.warning(
+                        f"Reservation submit result is uncertain: {submit_error}"
+                    )
+                    logger.info("Checking for a matching unpaid order...")
 
-                if trade_id and trade_no:
-                    logger.info(f"Successfully submitted reservation order")
+                    order_info = recover_unpaid_order(
+                        client,
+                        venue=venue,
+                        target_date=target_date,
+                        selected_space=selected_space,
+                        begin_time=selected_trades[0]["beginTime"],
+                    )
+
+                    if order_info is None and "未支付的订单" in str(submit_error):
+                        order_info = recover_unpaid_order(
+                            client,
+                            venue=venue,
+                            target_date=target_date,
+                            selected_space=None,
+                            begin_time=selected_trades[0]["beginTime"],
+                        )
+
+                    if order_info is None:
+                        raise submit_error
+
+                    recovered_space = order_info.get("venueSpaceName")
+                    if recovered_space:
+                        selected_space = str(recovered_space)
+
+                    recovered_start = str(
+                        order_info.get("reservationStartDate", "")
+                    )
+                    recovered_end = str(order_info.get("reservationEndDate", ""))
+                    if len(recovered_start) >= 5 and len(recovered_end) >= 5:
+                        selected_time = (
+                            f"{recovered_start[-5:]}-{recovered_end[-5:]}"
+                        )
+
                     logger.info(
-                        f"Check the order online: https://epe.pku.edu.cn/venue/orders"
+                        f"Recovered matching unpaid order: {selected_time} "
+                        f"{selected_space}场地"
                     )
-                    logger.breathe()
-                    break
 
-                else:
-                    raise Exception(
-                        f"Failed to submit reservation order: trade ID or trade No not found in response"
-                    )
+                trade_id = order_info.get("id")
+                trade_no = order_info["tradeNo"]
+
+                logger.info(
+                    f"Successfully submitted reservation order"
+                    f"{f' (ID: {trade_id})' if trade_id else ''}"
+                )
+                logger.info(
+                    f"Check the order online: https://epe.pku.edu.cn/venue/orders"
+                )
+                logger.breathe()
+                break
 
             except Exception as e:
                 logger.warning(f"Turn {turn}/{max_turns} failed: {e}")
