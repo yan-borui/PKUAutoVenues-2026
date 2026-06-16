@@ -439,7 +439,7 @@ def main(
                 total_fee = selection.total_fee
 
                 logger.info(
-                    f"Selected: venue {selected_venue}, {selected_time} {selected_space}场地 (¥{total_fee})"
+                    f"Selected: venue {selected_venue}, {selected_time} {selected_space}场地 (CNY {total_fee})"
                 )
                 logger.debug(f"Trades to submit:")
                 for trade in selected_trades:
@@ -590,7 +590,7 @@ def main(
                 raise Exception(f"payFee not found in pay response")
 
             logger.info(
-                f"Successfully paid ¥{pay_fee} for the reservation order with campus card"
+                f"Successfully paid CNY {pay_fee} for the reservation order with campus card"
             )
             logger.breathe()
             notifier.notify_message(
