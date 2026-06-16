@@ -7,6 +7,16 @@ from .logger import Logger
 from .encrypt import calculate_sign
 
 
+class EpeAPIError(Exception):
+
+    def __init__(self, method: str, path: str, code: int | None, message: str):
+        self.method = method
+        self.path = path
+        self.code = code
+        self.message = message
+        super().__init__(f"{method} {path} failed: ({code}) {message}")
+
+
 class Client:
 
     def __init__(self, name: str):
@@ -206,7 +216,7 @@ class EpeClient(Client):
         data = resp_json.get("data", {})
 
         if code != 200:
-            raise Exception(f"{method} {path} failed: ({code}) {message}")
+            raise EpeAPIError(method, path, code, message)
 
         return data
 

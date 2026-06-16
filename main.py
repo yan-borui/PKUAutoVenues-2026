@@ -4,10 +4,11 @@ import json
 import re
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 import random
 
-from utils.client import EpeClient
+from utils.client import EpeAPIError, EpeClient
 from utils.logger import Logger
 from utils.encrypt import (
     encrypt_rsa,
@@ -21,9 +22,169 @@ from utils.orders import extract_order_info, recover_unpaid_order
 from utils.time import get_next_weekday, get_release_time, wait_until
 from utils.config import LOGS_DIR, LOG_FILE, CONFIG
 
+MAX_CAPTCHA_TURNS = 8
+RESERVATION_INFO_URL = "https://epe.pku.edu.cn/venue-server/api/reservation/day/info"
+ReservationKey = tuple[str, tuple[tuple[str, str], ...]]
+
+
+@dataclass(slots=True)
+class ReservationSelection:
+    venue: str
+    space: str
+    trades: list[dict]
+
+    @property
+    def key(self) -> ReservationKey:
+        return (
+            self.venue,
+            tuple((trade["spaceId"], trade["timeId"]) for trade in self.trades),
+        )
+
+    @property
+    def selected_time(self) -> str:
+        return f"{self.trades[0]['beginTime']}-{self.trades[-1]['endTime']}"
+
+    @property
+    def total_fee(self) -> int:
+        return sum(trade["orderFee"] for trade in self.trades)
+
+
+def select_reservation(
+    info_data: dict,
+    venue: str,
+    target_date: str,
+    target_times: list[tuple[str, int]],
+    preferred_spaces: list[str],
+    rejected_reservations: set[ReservationKey],
+    logger: Logger,
+) -> ReservationSelection | None:
+    slots_info: list[dict] = sorted(
+        info_data.get("spaceTimeInfo", []),
+        key=lambda slot: slot["beginTime"],
+    )
+    begin_time_to_slot_idx: dict[str, int] = {
+        slot["beginTime"]: i for i, slot in enumerate(slots_info)
+    }
+
+    res_date_space_info: dict[str, list[dict]] = info_data.get(
+        "reservationDateSpaceInfo", {}
+    )
+    if target_date not in res_date_space_info:
+        raise Exception(
+            f"Target date {target_date} not found in reservationDateSpaceInfo"
+        )
+
+    spaces_res_info = res_date_space_info[target_date]
+
+    for begin_time, requested_slots_count in target_times:
+        slots_count = requested_slots_count
+        if begin_time not in begin_time_to_slot_idx:
+            logger.warning(
+                f"Venue {venue} ('{begin_time}', {slots_count}) begin time not found in spaceTimeInfo, skipping"
+            )
+            continue
+        begin_slot_idx = begin_time_to_slot_idx[begin_time]
+
+        if begin_slot_idx + slots_count > len(slots_info):
+            slots_max_count = len(slots_info) - begin_slot_idx
+            logger.warning(
+                f"Venue {venue} ('{begin_time}', {slots_count}) does not have enough following slots, reducing to {slots_max_count}"
+            )
+            slots_count = slots_max_count
+
+        target_slots_info = slots_info[begin_slot_idx : begin_slot_idx + slots_count]
+
+        available_space_to_trades: dict[str, list[dict]] = {}
+        for space_res_info in spaces_res_info:
+            trades: list[dict] = [
+                space_res_info.get(str(slot["id"]), {}) for slot in target_slots_info
+            ]
+            if not all(trade.get("reservationStatus") == 1 for trade in trades):
+                continue
+
+            candidate_trades = [
+                {
+                    "timeId": str(slot["id"]),
+                    "beginTime": slot["beginTime"],
+                    "endTime": slot["endTime"],
+                    "spaceId": str(space_res_info["id"]),
+                    "spaceName": space_res_info["spaceName"],
+                    "orderFee": int(trade["orderFee"]),
+                }
+                for slot, trade in zip(target_slots_info, trades)
+            ]
+            candidate_key: ReservationKey = (
+                venue,
+                tuple(
+                    (trade["spaceId"], trade["timeId"]) for trade in candidate_trades
+                ),
+            )
+            if candidate_key not in rejected_reservations:
+                available_space_to_trades[space_res_info["spaceName"]] = (
+                    candidate_trades
+                )
+
+        if not available_space_to_trades:
+            logger.info(
+                f"Venue {venue} ('{begin_time}', {slots_count}) has no available spaces"
+            )
+            continue
+
+        logger.info(
+            f"Venue {venue} ('{begin_time}', {slots_count}) available spaces: {list(available_space_to_trades.keys())}"
+        )
+        logger.breathe()
+
+        for space in preferred_spaces:
+            if space in available_space_to_trades:
+                selected_space = space
+                break
+        else:
+            selected_space = random.choice(list(available_space_to_trades.keys()))
+
+        return ReservationSelection(
+            venue=venue,
+            space=selected_space,
+            trades=available_space_to_trades[selected_space],
+        )
+
+    return None
+
+
+def find_reservation(
+    client: EpeClient,
+    venues: list[str],
+    target_date: str,
+    target_times: list[tuple[str, int]],
+    preferred_spaces: list[str],
+    rejected_reservations: set[ReservationKey],
+    logger: Logger,
+) -> ReservationSelection | None:
+    for venue in venues:
+        info_data = client.epe_get(
+            RESERVATION_INFO_URL,
+            params={
+                "venueSiteId": venue,
+                "searchDate": target_date,
+            },
+        )
+        selection = select_reservation(
+            info_data=info_data,
+            venue=venue,
+            target_date=target_date,
+            target_times=target_times,
+            preferred_spaces=preferred_spaces,
+            rejected_reservations=rejected_reservations,
+            logger=logger,
+        )
+        if selection is not None:
+            return selection
+
+    return None
+
 
 def main(
-    venue: str,
+    venues: list[str],
     target_date: str,
     target_times: list[tuple[str, int]],
     preferred_spaces: list[str],
@@ -33,7 +194,7 @@ def main(
     logger.info(f"Running: {' '.join(sys.argv)}")
     logger.breathe()
 
-    logger.info(f"Venue ID: {venue}")
+    logger.info(f"Venue IDs by priority: {venues}")
     logger.info(f"Target date: {target_date}")
     logger.info(f"Target times:")
     for begin_time, slots_count in target_times:
@@ -165,8 +326,9 @@ def main(
         Loop: Recognize captcha, fetch reservation info, and submit order
         """
 
-        max_turns = 20
+        max_turns = MAX_CAPTCHA_TURNS
         retry_delay = 0.2
+        rejected_reservations: set[ReservationKey] = set()
 
         # 填一次验证码只能用于一次 submit 请求，如果 submit 失败了，需要重新识别验证码，所以这里设计成循环
         # 由于识别验证码需要耗一些时间，最好先识别验证码再请求 info 数据，确保 info 数据的时效性，减少 submit 失败的概率
@@ -246,15 +408,6 @@ def main(
                 logger.info("Captcha verified successfully!")
                 logger.breathe()
 
-                # Fetch reservation info
-                info_data = client.epe_get(
-                    "https://epe.pku.edu.cn/venue-server/api/reservation/day/info",
-                    params={
-                        "venueSiteId": venue,
-                        "searchDate": target_date,
-                    },
-                )
-
                 logger.debug(f"Target date: {target_date}")
                 logger.debug(f"Target times:")
                 for begin_time, slots_count in target_times:
@@ -264,106 +417,34 @@ def main(
                 logger.debug(f"Preferred spaces: {preferred_spaces}")
                 logger.breathe()
 
-                slots_info: list[dict] = sorted(  # 时段
-                    info_data.get("spaceTimeInfo", []),
-                    key=lambda slot: slot["beginTime"],
+                selection = find_reservation(
+                    client=client,
+                    venues=venues,
+                    target_date=target_date,
+                    target_times=target_times,
+                    preferred_spaces=preferred_spaces,
+                    rejected_reservations=rejected_reservations,
+                    logger=logger,
                 )
-
-                begin_time_to_slot_idx: dict[str, int] = {
-                    slot["beginTime"]: i for i, slot in enumerate(slots_info)
-                }
-
-                res_date_space_info: dict[str, list[dict]] = info_data.get(
-                    "reservationDateSpaceInfo", {}
-                )
-
-                if target_date not in res_date_space_info:
+                if selection is None:
+                    logger.breathe()
                     raise Exception(
-                        f"Target date {target_date} not found in reservationDateSpaceInfo"
+                        f"None of the target venues and times have available spaces"
                     )
 
-                spaces_res_info: list[dict] = res_date_space_info[target_date]
+                selected_venue = selection.venue
+                selected_space = selection.space
+                selected_trades = selection.trades
+                selected_time = selection.selected_time
+                total_fee = selection.total_fee
 
-                for begin_time, slots_count in target_times:
-                    if begin_time not in begin_time_to_slot_idx:
-                        logger.warning(
-                            f"('{begin_time}', {slots_count}) Begin time {begin_time} not found in spaceTimeInfo, skipping"
-                        )
-                        continue
-                    begin_slot_idx = begin_time_to_slot_idx[begin_time]
-
-                    if begin_slot_idx + slots_count > len(slots_info):
-                        # slots: begin, begin + 1, ..., begin + count - 1
-                        slots_max_count = len(slots_info) - begin_slot_idx
-                        logger.warning(
-                            f"('{begin_time}', {slots_count}) Not enough slots after {begin_time}, reducing to {slots_max_count}"
-                        )
-                        slots_count = slots_max_count
-
-                    target_slots_info = slots_info[
-                        begin_slot_idx : begin_slot_idx + slots_count
-                    ]
-
-                    available_space_to_trades: dict[str, list[dict]] = {}
-                    for space_res_info in spaces_res_info:
-                        trades: list[dict] = [
-                            space_res_info.get(str(slot["id"]), {})
-                            for slot in target_slots_info
-                        ]
-                        if all(trade.get("reservationStatus") == 1 for trade in trades):
-                            # 1 空闲，2 不让约，3 待付款，4 已预约
-                            available_space_to_trades[space_res_info["spaceName"]] = [
-                                {
-                                    "timeId": str(slot["id"]),
-                                    "beginTime": slot["beginTime"],
-                                    "endTime": slot["endTime"],
-                                    "spaceId": str(space_res_info["id"]),
-                                    "spaceName": space_res_info["spaceName"],
-                                    "orderFee": int(trade["orderFee"]),
-                                }
-                                for slot, trade in zip(
-                                    target_slots_info,
-                                    trades,
-                                )
-                            ]
-
-                    if not available_space_to_trades:
-                        logger.info(
-                            f"('{begin_time}', {slots_count}) No available spaces"
-                        )
-                        continue
-
-                    logger.info(
-                        f"('{begin_time}', {slots_count}) Available spaces: {list(available_space_to_trades.keys())}"
-                    )
-                    logger.breathe()
-
-                    for space in preferred_spaces:
-                        if space in available_space_to_trades:
-                            selected_space = space
-                            break
-                    else:
-                        selected_space = random.choice(
-                            list(available_space_to_trades.keys())
-                        )
-
-                    selected_trades = available_space_to_trades[selected_space]
-
-                    selected_time = f"{selected_trades[0]['beginTime']}-{selected_trades[-1]['endTime']}"
-                    total_fee = sum(trade["orderFee"] for trade in selected_trades)
-
-                    logger.info(
-                        f"Selected: {selected_time} {selected_space}场地 (¥{total_fee})"
-                    )
-                    logger.debug(f"Trades to submit:")
-                    for trade in selected_trades:
-                        logger.debug(f"  - {trade}")
-                    logger.breathe()
-                    break
-
-                else:
-                    logger.breathe()
-                    raise Exception(f"None of the target times have available spaces")
+                logger.info(
+                    f"Selected: venue {selected_venue}, {selected_time} {selected_space}场地 (¥{total_fee})"
+                )
+                logger.debug(f"Trades to submit:")
+                for trade in selected_trades:
+                    logger.debug(f"  - {trade}")
+                logger.breathe()
 
                 # 如果 check captcha 后 submit 太快，submit 时会报 '(250) 验证码非法校验'
                 elapsed = time.perf_counter() - captcha_verified_at
@@ -397,7 +478,7 @@ def main(
                             "reservationType": "-1",
                             "orderPrice": total_fee,
                             "orderPin": generate_order_pin(),
-                            "venueSiteId": venue,
+                            "venueSiteId": selected_venue,
                             "phone": CONFIG["epe"]["phone"],
                         },
                         # Retrying a timed-out submit can create a duplicate order.
@@ -406,6 +487,17 @@ def main(
                     order_info = extract_order_info(submit_data)
 
                 except Exception as submit_error:
+                    if (
+                        isinstance(submit_error, EpeAPIError)
+                        and submit_error.code == 250
+                        and "已被其他人预约" in submit_error.message
+                    ):
+                        rejected_reservations.add(selection.key)
+                        logger.warning(
+                            f"Marked venue {selected_venue}, {selected_time} {selected_space}场地 unavailable locally"
+                        )
+                        raise
+
                     logger.warning(
                         f"Reservation submit result is uncertain: {submit_error}"
                     )
@@ -413,7 +505,7 @@ def main(
 
                     order_info = recover_unpaid_order(
                         client,
-                        venue=venue,
+                        venue=selected_venue,
                         target_date=target_date,
                         selected_space=selected_space,
                         begin_time=selected_trades[0]["beginTime"],
@@ -422,7 +514,7 @@ def main(
                     if order_info is None and "未支付的订单" in str(submit_error):
                         order_info = recover_unpaid_order(
                             client,
-                            venue=venue,
+                            venue=selected_venue,
                             target_date=target_date,
                             selected_space=None,
                             begin_time=selected_trades[0]["beginTime"],
@@ -484,7 +576,7 @@ def main(
             logger.breathe()
             notifier.notify_message(
                 "[PKUAutoVenues] 需要手动付款 >_<",
-                f"已成功预约 {target_date} {selected_time}（{selected_space}场地），请在十分钟内手动完成支付",
+                f"已成功预约 {target_date} {selected_time}（场馆 {selected_venue}，{selected_space}场地），请在十分钟内手动完成支付",
             )
             return
 
@@ -503,7 +595,7 @@ def main(
             logger.breathe()
             notifier.notify_message(
                 "[PKUAutoVenues] 预约成功 OvO",
-                f"已预约 {target_date} {selected_time}（{selected_space}场地），并成功用校园卡支付 {pay_fee} 元",
+                f"已预约 {target_date} {selected_time}（场馆 {selected_venue}，{selected_space}场地），并成功用校园卡支付 {pay_fee} 元",
             )
 
         except Exception as e:
@@ -511,7 +603,7 @@ def main(
             logger.breathe()
             notifier.notify_message(
                 "[PKUAutoVenues] 需要手动付款 >_<",
-                f"已成功预约 {target_date} {selected_time}（{selected_space}场地），请在十分钟内手动完成支付 (Error: {e})",
+                f"已成功预约 {target_date} {selected_time}（场馆 {selected_venue}，{selected_space}场地），请在十分钟内手动完成支付 (Error: {e})",
             )
 
     except Exception as e:
@@ -530,7 +622,13 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "-v", "--venue", required=True, help="Venue site name or ID, e.g. qdb, 86"
+        "-v",
+        "--venue",
+        "--venues",
+        dest="venues",
+        required=True,
+        nargs="+",
+        help="Venue site names or IDs by priority, e.g. qdb 86",
     )
     parser.add_argument(
         "-d",
@@ -567,16 +665,20 @@ if __name__ == "__main__":
         "ws": "86",
         "五四": "86",
     }
-    if args.venue in venue_aliases:
-        venue = venue_aliases[args.venue]
-    else:
-        try:
-            int(args.venue)
-        except ValueError:
-            parser.error(
-                f"Invalid -v/--venue {args.venue!r}: must be an alias or an integer"
-            )
-        venue = args.venue
+    venues = []
+    for venue_arg in args.venues:
+        if venue_arg in venue_aliases:
+            venue = venue_aliases[venue_arg]
+        else:
+            try:
+                int(venue_arg)
+            except ValueError:
+                parser.error(
+                    f"Invalid -v/--venue item {venue_arg!r}: must be an alias or an integer"
+                )
+            venue = venue_arg
+        if venue not in venues:
+            venues.append(venue)
 
     # Process date
     if re.fullmatch(r"[1-7]", args.date):
@@ -624,7 +726,7 @@ if __name__ == "__main__":
             preferred_spaces.append(s)
 
     main(
-        venue=venue,
+        venues=venues,
         target_date=target_date,
         target_times=target_times,
         preferred_spaces=preferred_spaces,
