@@ -17,6 +17,26 @@ class EpeAPIError(Exception):
         super().__init__(f"{method} {path} failed: ({code}) {message}")
 
 
+class EpeUnavailableError(Exception):
+    status_code = 502
+
+    def __init__(self, method: str, path: str):
+        self.method = method
+        self.path = path
+        super().__init__(f"{method} {path} failed: HTTP 502 Bad Gateway")
+
+
+class TransportUnavailableError(Exception):
+    def __init__(self, method: str, url: str, attempts: int, cause: Exception):
+        self.method = method
+        self.url = url
+        self.attempts = attempts
+        self.cause = cause
+        super().__init__(
+            f"{method} {url} failed after {attempts} transport attempts: {cause}"
+        )
+
+
 class Client:
 
     def __init__(self, name: str):
@@ -83,11 +103,13 @@ class Client:
                     self._logger.debug(f"  {key}: {value}")
         self._logger.breathe()
 
+        last_error: Exception | None = None
         for attempt in range(1, max_attempts + 1):
             try:
                 resp = self.session.request(method, url, **kwargs)
                 break
             except Exception as e:
+                last_error = e
                 self._logger.warning(f"Attempt {attempt}/{max_attempts} failed: {e}")
                 if attempt < max_attempts:
                     self._logger.warning(f"Retrying in {retry_delay} seconds...")
@@ -95,9 +117,13 @@ class Client:
                 self._logger.breathe()
         else:
             self._logger.error(f"All {max_attempts} attempts failed, exiting")
-            raise Exception(
-                f"Failed to send request after {max_attempts} attempts ({method} {url})"
-            )
+            assert last_error is not None
+            raise TransportUnavailableError(
+                method,
+                url,
+                max_attempts,
+                last_error,
+            ) from last_error
 
         self._logger.debug(f"Response status: {resp.status_code}")
 
@@ -200,6 +226,9 @@ class EpeClient(Client):
 
         resp = super()._request(method, url, **kwargs)
         # 可能会 raise Exception，保持 message 让父过程 catch
+
+        if resp.status_code == EpeUnavailableError.status_code:
+            raise EpeUnavailableError(method, path)
 
         try:
             resp_json = resp.json()
