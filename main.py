@@ -7,8 +7,14 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import random
+from typing import Callable, TypeVar
 
-from utils.client import EpeAPIError, EpeClient
+from utils.client import (
+    EpeAPIError,
+    EpeClient,
+    EpeUnavailableError,
+    TransportUnavailableError,
+)
 from utils.logger import Logger
 from utils.encrypt import (
     encrypt_rsa,
@@ -23,8 +29,25 @@ from utils.time import get_next_weekday, get_release_time, wait_until
 from utils.config import LOGS_DIR, LOG_FILE, CONFIG
 
 MAX_CAPTCHA_TURNS = 8
+RETURNED_SLOT_OFFSETS_MINUTES = (11, 12, 13)
 RESERVATION_INFO_URL = "https://epe.pku.edu.cn/venue-server/api/reservation/day/info"
 ReservationKey = tuple[str, tuple[tuple[str, str], ...]]
+AttemptResult = TypeVar("AttemptResult")
+
+
+@dataclass(frozen=True, slots=True)
+class ReservationWindow:
+    start_at: datetime
+    max_attempts: int
+    label: str
+
+
+@dataclass(slots=True)
+class ReservationResult:
+    venue: str
+    space: str
+    selected_time: str
+    trade_no: str
 
 
 @dataclass(slots=True)
@@ -183,12 +206,304 @@ def find_reservation(
     return None
 
 
+def build_reservation_windows(
+    release_time: datetime,
+    retry_returned_slots: bool,
+) -> list[ReservationWindow]:
+    if not retry_returned_slots:
+        return [
+            ReservationWindow(
+                start_at=release_time,
+                max_attempts=MAX_CAPTCHA_TURNS,
+                label="main reservation window",
+            )
+        ]
+
+    windows = [
+        ReservationWindow(
+            start_at=release_time,
+            max_attempts=MAX_CAPTCHA_TURNS,
+            label="main reservation window",
+        )
+    ]
+    windows.extend(
+        ReservationWindow(
+            start_at=release_time + timedelta(minutes=offset),
+            max_attempts=MAX_CAPTCHA_TURNS,
+            label=f"returned-slot window at 12:{offset:02d}:00",
+        )
+        for offset in RETURNED_SLOT_OFFSETS_MINUTES
+    )
+    return windows
+
+
+def wait_for_epe(
+    client: EpeClient,
+    venue: str,
+    target_date: str,
+    logger: Logger,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    logger.warning("EPE returned HTTP 502; starting 1-second heartbeat polling")
+    while True:
+        sleep(1)
+        try:
+            client.epe_get(
+                RESERVATION_INFO_URL,
+                params={
+                    "venueSiteId": venue,
+                    "searchDate": target_date,
+                },
+                timeout=1.0,
+                max_attempts=1,
+            )
+            logger.info("EPE heartbeat succeeded; resuming reservation flow")
+            logger.breathe()
+            return
+        except (EpeUnavailableError, TransportUnavailableError) as e:
+            logger.warning(f"EPE is still unavailable ({e}); polling again in 1 second")
+
+
+def run_reservation_window(
+    attempt: Callable[[], AttemptResult],
+    heartbeat: Callable[[], None],
+    max_attempts: int,
+    logger: Logger,
+    retry_delay: float = 0.2,
+    sleep: Callable[[float], None] = time.sleep,
+) -> AttemptResult | None:
+    turn = 1
+    while turn <= max_attempts:
+        try:
+            return attempt()
+        except (EpeUnavailableError, TransportUnavailableError) as e:
+            logger.warning(
+                f"Attempt {turn}/{max_attempts} paused without consuming its budget: {e}"
+            )
+            heartbeat()
+            continue
+        except Exception as e:
+            logger.warning(f"Attempt {turn}/{max_attempts} failed: {e}")
+            if turn < max_attempts:
+                logger.warning(f"Retrying in {retry_delay} seconds...")
+                sleep(retry_delay)
+            logger.breathe()
+            turn += 1
+
+    return None
+
+
+def attempt_reservation(
+    client: EpeClient,
+    recognizer: Recognizer,
+    client_point_uid: str,
+    venues: list[str],
+    target_date: str,
+    target_times: list[tuple[str, int]],
+    preferred_spaces: list[str],
+    rejected_reservations: set[ReservationKey],
+    logger: Logger,
+) -> ReservationResult:
+    get_captcha_data = client.epe_get(
+        "https://epe.pku.edu.cn/venue-server/api/captcha/get",
+        params={
+            "captchaType": "clickWord",
+            "clientUid": client_point_uid,
+            "ts": str(int(time.time() * 1000)),
+        },
+    )
+
+    if get_captcha_data.get("success") is not True:
+        raise Exception(f"Failed to get captcha: {get_captcha_data.get('repMsg')}")
+
+    rep_data = get_captcha_data["repData"]
+    image_base64 = rep_data["originalImageBase64"]
+    words = rep_data["wordList"]
+    captcha_token = rep_data["token"]
+    captcha_secret_key = rep_data["secretKey"]
+
+    image_path = (
+        LOGS_DIR / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')[:-3]}.png"
+    )
+    image_path.write_bytes(base64.b64decode(image_base64))
+
+    logger.info(f"Captcha image saved to: {image_path}")
+    logger.info(f"Words to click: {words}")
+    logger.debug(f"Captcha token: {captcha_token}")
+    logger.debug(f"Captcha secret key: {captcha_secret_key}")
+    logger.breathe()
+
+    recognize_result = recognizer.recognize_captcha(image_base64, words)
+    recognized_points = json.dumps(
+        [{"x": x, "y": y} for x, y in recognize_result],
+        separators=(",", ":"),
+    )
+
+    check_captcha_data = client.epe_post(
+        "https://epe.pku.edu.cn/venue-server/api/captcha/check",
+        data={
+            "captchaType": "clickWord",
+            "pointJson": encrypt_aes_ecb(recognized_points, captcha_secret_key),
+            "token": captcha_token,
+        },
+    )
+
+    if check_captcha_data.get("success") is not True:
+        raise Exception(
+            "Failed to pass captcha check, maybe the recognition is wrong: "
+            f"{check_captcha_data.get('repMsg')}"
+        )
+
+    captcha_verified_at = time.perf_counter()
+    logger.info("Captcha verified successfully!")
+    logger.breathe()
+
+    selection = find_reservation(
+        client=client,
+        venues=venues,
+        target_date=target_date,
+        target_times=target_times,
+        preferred_spaces=preferred_spaces,
+        rejected_reservations=rejected_reservations,
+        logger=logger,
+    )
+    if selection is None:
+        logger.breathe()
+        raise Exception("None of the target venues and times have available spaces")
+
+    selected_venue = selection.venue
+    selected_space = selection.space
+    selected_trades = selection.trades
+    selected_time = selection.selected_time
+    total_fee = selection.total_fee
+
+    logger.info(
+        f"Selected: venue {selected_venue}, {selected_time} "
+        f"{selected_space}场地 (CNY {total_fee})"
+    )
+    logger.debug("Trades to submit:")
+    for trade in selected_trades:
+        logger.debug(f"  - {trade}")
+    logger.breathe()
+
+    elapsed = time.perf_counter() - captcha_verified_at
+    if elapsed < 1:
+        logger.info(f"Sleep for {1 - elapsed:.2f} seconds...")
+        logger.breathe()
+        time.sleep(1 - elapsed)
+
+    try:
+        submit_data = client.epe_post(
+            "https://epe.pku.edu.cn/venue-server/api/reservation/order/submit",
+            data={
+                "captchaVerification": encrypt_aes_ecb(
+                    captcha_token + "---" + recognized_points,
+                    captcha_secret_key,
+                ),
+                "captchaToken": captcha_token,
+                "reservationOrderJson": json.dumps(
+                    [
+                        {"spaceId": trade["spaceId"], "timeId": trade["timeId"]}
+                        for trade in selected_trades
+                    ],
+                    separators=(",", ":"),
+                ),
+                "reservationDate": target_date,
+                "weekStartDate": target_date,
+                "reservationType": "-1",
+                "orderPrice": total_fee,
+                "orderPin": generate_order_pin(),
+                "venueSiteId": selected_venue,
+                "phone": CONFIG["epe"]["phone"],
+            },
+            # Retrying a timed-out submit can create a duplicate order.
+            max_attempts=1,
+        )
+        order_info = extract_order_info(submit_data)
+
+    except Exception as submit_error:
+        if (
+            isinstance(submit_error, EpeAPIError)
+            and submit_error.code == 250
+            and "已被其他人预约" in submit_error.message
+        ):
+            rejected_reservations.add(selection.key)
+            logger.warning(
+                f"Marked venue {selected_venue}, {selected_time} "
+                f"{selected_space}场地 unavailable locally"
+            )
+            raise
+
+        logger.warning(f"Reservation submit result is uncertain: {submit_error}")
+        logger.info("Checking for a matching unpaid order...")
+
+        while True:
+            try:
+                order_info = recover_unpaid_order(
+                    client,
+                    venue=selected_venue,
+                    target_date=target_date,
+                    selected_space=selected_space,
+                    begin_time=selected_trades[0]["beginTime"],
+                )
+
+                if order_info is None and "未支付的订单" in str(submit_error):
+                    order_info = recover_unpaid_order(
+                        client,
+                        venue=selected_venue,
+                        target_date=target_date,
+                        selected_space=None,
+                        begin_time=selected_trades[0]["beginTime"],
+                    )
+                break
+            except (EpeUnavailableError, TransportUnavailableError):
+                wait_for_epe(
+                    client=client,
+                    venue=selected_venue,
+                    target_date=target_date,
+                    logger=logger,
+                )
+
+        if order_info is None:
+            raise submit_error
+
+        recovered_space = order_info.get("venueSpaceName")
+        if recovered_space:
+            selected_space = str(recovered_space)
+
+        recovered_start = str(order_info.get("reservationStartDate", ""))
+        recovered_end = str(order_info.get("reservationEndDate", ""))
+        if len(recovered_start) >= 5 and len(recovered_end) >= 5:
+            selected_time = f"{recovered_start[-5:]}-{recovered_end[-5:]}"
+
+        logger.info(
+            f"Recovered matching unpaid order: {selected_time} {selected_space}场地"
+        )
+
+    trade_id = order_info.get("id")
+    trade_no = order_info["tradeNo"]
+    logger.info(
+        "Successfully submitted reservation order"
+        f"{f' (ID: {trade_id})' if trade_id else ''}"
+    )
+    logger.info("Check the order online: https://epe.pku.edu.cn/venue/orders")
+    logger.breathe()
+
+    return ReservationResult(
+        venue=selected_venue,
+        space=selected_space,
+        selected_time=selected_time,
+        trade_no=trade_no,
+    )
+
+
 def main(
     venues: list[str],
     target_date: str,
     target_times: list[tuple[str, int]],
     preferred_spaces: list[str],
     skip_pay: bool,
+    retry_returned_slots: bool,
 ):
     logger = Logger("main")
     logger.info(f"Running: {' '.join(sys.argv)}")
@@ -204,6 +519,7 @@ def main(
         )
     logger.info(f"Preferred spaces: {preferred_spaces}")
     logger.info(f"Auto payment with campus card: {not skip_pay}")
+    logger.info(f"Retry returned slots: {retry_returned_slots}")
     logger.breathe()
 
     release_time = get_release_time(target_date)
@@ -213,7 +529,11 @@ def main(
     logger.info(f"Quota release time: {release_time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"Plan:")
     logger.info(f"  - login at {login_time.strftime('%H:%M:%S')}")
-    logger.info(f"  - start main loop at {release_time.strftime('%H:%M:%S')}")
+    for window in build_reservation_windows(release_time, retry_returned_slots):
+        logger.info(
+            f"  - {window.label} at {window.start_at.strftime('%H:%M:%S')} "
+            f"({window.max_attempts} attempt(s))"
+        )
     logger.breathe()
 
     client = EpeClient("epe")
@@ -326,246 +646,60 @@ def main(
         Loop: Recognize captcha, fetch reservation info, and submit order
         """
 
-        max_turns = MAX_CAPTCHA_TURNS
-        retry_delay = 0.2
-        rejected_reservations: set[ReservationKey] = set()
-
-        # 填一次验证码只能用于一次 submit 请求，如果 submit 失败了，需要重新识别验证码，所以这里设计成循环
-        # 由于识别验证码需要耗一些时间，最好先识别验证码再请求 info 数据，确保 info 数据的时效性，减少 submit 失败的概率
-
-        # 经试验，“在 12 点之前就识别好验证码，一到 12 点立刻获取 info 并提交” 是不行的，
-        # 过了 12 点验证码会失效，submit 时会报 '(250) 验证码没有通过'
-
+        # A checked captcha can only be submitted once. Each release window gets
+        # an independent attempt budget.
         client_point_uid = f"point-{generate_uuid()}"
+        reservation_result: ReservationResult | None = None
+        windows = build_reservation_windows(release_time, retry_returned_slots)
 
-        wait_until(release_time, logger, "main loop", strict=True)
+        for window in windows:
+            wait_until(window.start_at, logger, window.label, strict=True)
+            logger.info(
+                f"Starting {window.label} with {window.max_attempts} attempt(s)"
+            )
+            logger.breathe()
 
-        for turn in range(1, max_turns + 1):
-            try:
-                # Get captcha
-                get_captcha_data = client.epe_get(
-                    "https://epe.pku.edu.cn/venue-server/api/captcha/get",
-                    params={
-                        "captchaType": "clickWord",
-                        "clientUid": client_point_uid,
-                        "ts": str(int(time.time() * 1000)),
-                    },
-                )
-
-                if get_captcha_data.get("success") is not True:
-                    raise Exception(
-                        f"Failed to get captcha: {get_captcha_data.get('repMsg')}"
-                    )
-
-                rep_data = get_captcha_data["repData"]
-
-                image_base64 = rep_data["originalImageBase64"]
-                words = rep_data["wordList"]
-                captcha_token = rep_data["token"]
-                captcha_secret_key = rep_data["secretKey"]
-
-                image_path = (
-                    LOGS_DIR
-                    / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')[:-3]}.png"
-                )
-                image_path.write_bytes(base64.b64decode(image_base64))
-
-                logger.info(f"Captcha image saved to: {image_path}")
-                logger.info(f"Words to click: {words}")
-                logger.debug(f"Captcha token: {captcha_token}")
-                logger.debug(f"Captcha secret key: {captcha_secret_key}")
-                logger.breathe()
-
-                # Recognize captcha
-                recognize_result = recognizer.recognize_captcha(image_base64, words)
-
-                # [(234, 47), (168, 90), (101, 63)]
-                # -> '[{"x":234,"y":47},{"x":168,"y":90},{"x":101,"y":63}]'
-                recognized_points = json.dumps(
-                    [{"x": x, "y": y} for x, y in recognize_result],
-                    separators=(",", ":"),
-                )
-
-                # Check captcha
-                check_captcha_data = client.epe_post(
-                    "https://epe.pku.edu.cn/venue-server/api/captcha/check",
-                    data={
-                        "captchaType": "clickWord",
-                        "pointJson": encrypt_aes_ecb(
-                            recognized_points, captcha_secret_key
-                        ),
-                        "token": captcha_token,
-                    },
-                )
-
-                if check_captcha_data.get("success") is not True:
-                    raise Exception(
-                        f"Failed to pass captcha check, maybe the recognition is wrong: {check_captcha_data.get('repMsg')}"
-                    )
-
-                captcha_verified_at = time.perf_counter()
-
-                logger.info("Captcha verified successfully!")
-                logger.breathe()
-
-                logger.debug(f"Target date: {target_date}")
-                logger.debug(f"Target times:")
-                for begin_time, slots_count in target_times:
-                    logger.debug(
-                        f"  - begin at {begin_time}, {f'{slots_count} consecutive slots' if slots_count > 1 else 'single slot'}"
-                    )
-                logger.debug(f"Preferred spaces: {preferred_spaces}")
-                logger.breathe()
-
-                selection = find_reservation(
+            # A rejected combination may become available again in a later window.
+            rejected_reservations: set[ReservationKey] = set()
+            reservation_result = run_reservation_window(
+                attempt=lambda: attempt_reservation(
                     client=client,
+                    recognizer=recognizer,
+                    client_point_uid=client_point_uid,
                     venues=venues,
                     target_date=target_date,
                     target_times=target_times,
                     preferred_spaces=preferred_spaces,
                     rejected_reservations=rejected_reservations,
                     logger=logger,
-                )
-                if selection is None:
-                    logger.breathe()
-                    raise Exception(
-                        f"None of the target venues and times have available spaces"
-                    )
-
-                selected_venue = selection.venue
-                selected_space = selection.space
-                selected_trades = selection.trades
-                selected_time = selection.selected_time
-                total_fee = selection.total_fee
-
-                logger.info(
-                    f"Selected: venue {selected_venue}, {selected_time} {selected_space}场地 (CNY {total_fee})"
-                )
-                logger.debug(f"Trades to submit:")
-                for trade in selected_trades:
-                    logger.debug(f"  - {trade}")
-                logger.breathe()
-
-                # 如果 check captcha 后 submit 太快，submit 时会报 '(250) 验证码非法校验'
-                elapsed = time.perf_counter() - captcha_verified_at
-                if elapsed < 1:
-                    logger.info(f"Sleep for {1 - elapsed:.2f} seconds...")
-                    logger.breathe()
-                    time.sleep(1 - elapsed)
-
-                # Submit reservation order
-                try:
-                    submit_data = client.epe_post(
-                        "https://epe.pku.edu.cn/venue-server/api/reservation/order/submit",
-                        data={
-                            "captchaVerification": encrypt_aes_ecb(
-                                captcha_token + "---" + recognized_points,
-                                captcha_secret_key,
-                            ),
-                            "captchaToken": captcha_token,
-                            "reservationOrderJson": json.dumps(
-                                [
-                                    {
-                                        "spaceId": trade["spaceId"],
-                                        "timeId": trade["timeId"],
-                                    }
-                                    for trade in selected_trades
-                                ],
-                                separators=(",", ":"),
-                            ),
-                            "reservationDate": target_date,
-                            "weekStartDate": target_date,
-                            "reservationType": "-1",
-                            "orderPrice": total_fee,
-                            "orderPin": generate_order_pin(),
-                            "venueSiteId": selected_venue,
-                            "phone": CONFIG["epe"]["phone"],
-                        },
-                        # Retrying a timed-out submit can create a duplicate order.
-                        max_attempts=1,
-                    )
-                    order_info = extract_order_info(submit_data)
-
-                except Exception as submit_error:
-                    if (
-                        isinstance(submit_error, EpeAPIError)
-                        and submit_error.code == 250
-                        and "已被其他人预约" in submit_error.message
-                    ):
-                        rejected_reservations.add(selection.key)
-                        logger.warning(
-                            f"Marked venue {selected_venue}, {selected_time} {selected_space}场地 unavailable locally"
-                        )
-                        raise
-
-                    logger.warning(
-                        f"Reservation submit result is uncertain: {submit_error}"
-                    )
-                    logger.info("Checking for a matching unpaid order...")
-
-                    order_info = recover_unpaid_order(
-                        client,
-                        venue=selected_venue,
-                        target_date=target_date,
-                        selected_space=selected_space,
-                        begin_time=selected_trades[0]["beginTime"],
-                    )
-
-                    if order_info is None and "未支付的订单" in str(submit_error):
-                        order_info = recover_unpaid_order(
-                            client,
-                            venue=selected_venue,
-                            target_date=target_date,
-                            selected_space=None,
-                            begin_time=selected_trades[0]["beginTime"],
-                        )
-
-                    if order_info is None:
-                        raise submit_error
-
-                    recovered_space = order_info.get("venueSpaceName")
-                    if recovered_space:
-                        selected_space = str(recovered_space)
-
-                    recovered_start = str(
-                        order_info.get("reservationStartDate", "")
-                    )
-                    recovered_end = str(order_info.get("reservationEndDate", ""))
-                    if len(recovered_start) >= 5 and len(recovered_end) >= 5:
-                        selected_time = (
-                            f"{recovered_start[-5:]}-{recovered_end[-5:]}"
-                        )
-
-                    logger.info(
-                        f"Recovered matching unpaid order: {selected_time} "
-                        f"{selected_space}场地"
-                    )
-
-                trade_id = order_info.get("id")
-                trade_no = order_info["tradeNo"]
-
-                logger.info(
-                    f"Successfully submitted reservation order"
-                    f"{f' (ID: {trade_id})' if trade_id else ''}"
-                )
-                logger.info(
-                    f"Check the order online: https://epe.pku.edu.cn/venue/orders"
-                )
-                logger.breathe()
+                ),
+                heartbeat=lambda: wait_for_epe(
+                    client=client,
+                    venue=venues[0],
+                    target_date=target_date,
+                    logger=logger,
+                ),
+                max_attempts=window.max_attempts,
+                logger=logger,
+            )
+            if reservation_result is not None:
                 break
 
-            except Exception as e:
-                logger.warning(f"Turn {turn}/{max_turns} failed: {e}")
-                if turn < max_turns:
-                    logger.warning(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                logger.breathe()
+            logger.warning(f"No reservation completed in {window.label}")
+            logger.breathe()
 
-        else:
-            logger.error(f"All {max_turns} turns failed, exiting")
+        if reservation_result is None:
+            total_attempts = sum(window.max_attempts for window in windows)
+            logger.error("All reservation windows exhausted, exiting")
             raise Exception(
-                f"Failed to find available spaces for reservation after {max_turns} turns"
+                "Failed to find available spaces after "
+                f"{total_attempts} reservation attempts"
             )
+
+        selected_venue = reservation_result.venue
+        selected_space = reservation_result.space
+        selected_time = reservation_result.selected_time
+        trade_no = reservation_result.trade_no
 
         """
         Pay with campus card (optional)
@@ -655,6 +789,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip auto payment, need to manually pay within 10 minutes",
     )
+    parser.add_argument(
+        "--no-returned-slots",
+        "--no-reflow",
+        dest="retry_returned_slots",
+        action="store_false",
+        help="Disable returned-slot attempts at 12:11, 12:12, and 12:13",
+    )
     args = parser.parse_args()
 
     # Process venue
@@ -731,4 +872,5 @@ if __name__ == "__main__":
         target_times=target_times,
         preferred_spaces=preferred_spaces,
         skip_pay=args.skip_pay,
+        retry_returned_slots=args.retry_returned_slots,
     )

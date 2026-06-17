@@ -22,7 +22,7 @@ echo 'cd ~/PKUAutoVenues-2026 && \
 
 - [qqworld-tutu/PKUautoBookingVenues-fixed-by-cq-tutu](https://github.com/qqworld-tutu/PKUautoBookingVenues-fixed-by-cq-tutu)
 
-## 如何使用（<a href="https://www.kimi.com/_prefill_chat?prefill_prompt=请阅读一下 https://github.com/goudanZ1/PKUAutoVenues-2026 这个项目，我应该如何使用它？&send_immediately=true&force_search=true">Chat with Kimi</a>）
+## 如何使用（<a href="https://www.kimi.com/_prefill_chat?prefill_prompt=请阅读一下 https://github.com/yan-borui/PKUAutoVenues-2026 这个项目，我应该如何使用它？&send_immediately=true&force_search=true">Chat with Kimi</a>）
 
 1. 安装 [uv](https://docs.astral.sh/uv/)
 
@@ -33,7 +33,7 @@ echo 'cd ~/PKUAutoVenues-2026 && \
 2. 将项目 clone 到本地
 
    ```bash
-   git clone https://github.com/goudanZ1/PKUAutoVenues-2026
+   git clone https://github.com/yan-borui/PKUAutoVenues-2026
    cd PKUAutoVenues-2026
    ```
 
@@ -97,11 +97,14 @@ uv run main.py -h
 
 2. 通过不断轮询，等待到名额释放前 1 分钟，登录智慧场馆系统
 
-3. 等待到 12 点，开始循环（最多 8 轮，避免超过智慧场馆的验证码次数限制）：
+3. 等待到 12 点，开始预约；12:00 最多尝试 8 次，如果仍未成功，再等待 12:11:00、12:12:00、12:13:00 抢可能因未付款而释放的回流场，每个回流时间窗口也各自最多尝试 8 次：
    - 获取验证码并识别、校验
    - 按 `venue` 参数顺序获取 `date` 日期各场馆的预约信息，筛选出每个场地的空闲时段；前一个场馆有候选时不会请求后续场馆
    - 根据 `times` 和 `spaces` 优先级，决定本轮要尝试预约哪个场地的哪个（哪些）时段
    - 提交订单，如果服务端提示场地已被预约，则在本地排除该预约组合，避免场地列表接口延迟造成重复失败；预约成功后尝试使用校园卡支付（除非设置了 `--skip-pay`）
+   - 如果智慧场馆返回 HTTP 502，当前尝试不会被计为失败；程序会每秒发送一次心跳，网站恢复后继续预约
+
+   回流场功能默认开启。使用 `--no-returned-slots`（或 `--no-reflow`）可关闭，此时只执行 12:00 的 8 次尝试。
 
 4. 向你发送预约结果
 
