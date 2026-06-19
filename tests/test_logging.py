@@ -77,13 +77,19 @@ class LoggingTests(unittest.TestCase):
 
     def test_sensitive_and_large_values_are_safe_to_log(self):
         sanitized = sanitize_log_message(
-            "captcha token: abc123 password=secret phone: 13800000000"
+            "captcha token: abc123 password=secret phone: 13800000000 "
+            "https://sctapi.ftqq.com/SCT-secret.send "
+            "https://123.push.ft07.com/send/sctp-secret.send "
+            "https://api.day.app/bark-secret"
         )
 
         self.assertNotIn("abc123", sanitized)
         self.assertNotIn("secret", sanitized)
         self.assertNotIn("13800000000", sanitized)
         self.assertIn("<redacted>", sanitized)
+        self.assertIn("https://sctapi.ftqq.com/<redacted>.send", sanitized)
+        self.assertIn("https://123.push.ft07.com/send/<redacted>.send", sanitized)
+        self.assertIn("https://api.day.app/<redacted>", sanitized)
         self.assertEqual(format_log_value("file_base64", "x" * 1000), "<1000 chars>")
 
     def test_json_debug_log_keeps_shape_without_full_payloads(self):

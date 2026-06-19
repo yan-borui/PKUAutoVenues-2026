@@ -34,6 +34,14 @@ _KEY_VALUE_PATTERN = re.compile(
     r"user|userName|username"
     r")(\s*[:=]\s*)([^\s,;)}\]]+)"
 )
+_SECRET_URL_PATTERNS = (
+    re.compile(r"(https://sctapi\.ftqq\.com/)[^/\s]+(\.send\b)", re.IGNORECASE),
+    re.compile(
+        r"(https://[^/\s]+\.push\.ft07\.com/send/)[^/\s]+(\.send\b)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(https://api\.day\.app/)[^/\s]+()", re.IGNORECASE),
+)
 
 
 def is_sensitive_key(key: Any) -> bool:
@@ -61,7 +69,13 @@ def format_log_value(key: Any, value: Any) -> str:
 
 
 def sanitize_log_message(msg: str) -> str:
-    return _KEY_VALUE_PATTERN.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", msg)
+    msg = _KEY_VALUE_PATTERN.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
+        msg,
+    )
+    for pattern in _SECRET_URL_PATTERNS:
+        msg = pattern.sub(r"\1<redacted>\2", msg)
+    return msg
 
 
 class Logger:
