@@ -1,6 +1,6 @@
 import time
 
-from .client import Client
+from .client import Client, get_response_json
 from .logger import Logger
 from .encrypt import md5_hash
 from .config import CONFIG
@@ -59,7 +59,7 @@ class Recognizer:
             },
             timeout=4.0,
         )
-        return resp.json()["data"]["result"]
+        return get_response_json(resp)["data"]["result"]
 
     def _chaojiying(self, image_base64: str, words: list[str]) -> str:
         resp = self._client.post(
@@ -74,4 +74,4 @@ class Recognizer:
             },
             timeout=4.0,
         )
-        return resp.json()["pic_str"]
+        return get_response_json(resp)["pic_str"]

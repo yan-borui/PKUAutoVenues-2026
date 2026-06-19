@@ -14,6 +14,7 @@ from utils.client import (
     EpeClient,
     EpeUnavailableError,
     TransportUnavailableError,
+    get_response_json,
 )
 from utils.logger import Logger
 from utils.encrypt import (
@@ -577,7 +578,7 @@ def main(
         )
 
         try:
-            iaaa_json: dict = iaaa_resp.json()
+            iaaa_json: dict = get_response_json(iaaa_resp)
         except Exception as e:
             raise Exception(f"Failed to parse IAAA response as JSON: {e}")
 

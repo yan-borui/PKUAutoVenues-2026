@@ -3,7 +3,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.utils import formataddr
 
-from .client import Client
+from .client import Client, get_response_json
 from .logger import Logger
 from .config import CONFIG
 
@@ -104,7 +104,7 @@ class Notifier:
             timeout=60.0,
         )
 
-        response_data = response.json()
+        response_data = get_response_json(response)
 
         if response_data["code"] != 0:
             raise Exception(
@@ -125,7 +125,7 @@ class Notifier:
             timeout=60.0,
         )
 
-        response_data = response.json()
+        response_data = get_response_json(response)
 
         if response_data["code"] != 0:
             if response_data["code"] == 40001 and response_data.get("scode") == 471:
@@ -151,7 +151,7 @@ class Notifier:
             timeout=60.0,
         )
 
-        response_data = response.json()
+        response_data = get_response_json(response)
 
         if response_data["code"] != 200:
             raise Exception(
