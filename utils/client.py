@@ -3,8 +3,21 @@ from requests import sessions
 from requests.models import Response
 from typing import Literal, Optional
 
-from .logger import Logger
+from .logger import Logger, format_log_value, is_sensitive_key
 from .encrypt import calculate_sign
+
+_CACHED_JSON_ATTR = "_pkuautovenues_json"
+MAX_LOG_ITEMS = 2
+MAX_LOG_DEPTH = 6
+
+
+def get_response_json(resp: Response):
+    if _CACHED_JSON_ATTR in getattr(resp, "__dict__", {}):
+        return getattr(resp, _CACHED_JSON_ATTR)
+
+    resp_json = resp.json()
+    setattr(resp, _CACHED_JSON_ATTR, resp_json)
+    return resp_json
 
 
 class EpeAPIError(Exception):
@@ -55,33 +68,58 @@ class Client:
 
         if isinstance(data, dict):
             for k, v in data.items():
-                if isinstance(v, dict):
-                    if len(v.keys()) >= 30:  # reservationDateSpaceInfo is too long
-                        self._logger.debug(f"{indent}{k}: {v}")
+                if is_sensitive_key(k):
+                    self._logger.debug(f"{indent}{k}: <redacted>")
+                elif isinstance(v, dict):
+                    if level >= MAX_LOG_DEPTH:
+                        keys = list(v.keys())
+                        sample_keys = ", ".join(str(key) for key in keys[:MAX_LOG_ITEMS])
+                        suffix = ", ..." if len(keys) > MAX_LOG_ITEMS else ""
+                        self._logger.debug(
+                            f"{indent}{k}: Object({len(v)} keys"
+                            f"{f'; sample keys: {sample_keys}{suffix}' if keys else ''})"
+                        )
                     else:
                         self._logger.debug(f"{indent}{k}:")
                         self._log_json(v, level + 1)
                 elif isinstance(v, list):
-                    self._logger.debug(f"{indent}{k}: Array({len(v)}) {v}")
+                    self._logger.debug(f"{indent}{k}: Array({len(v)})")
                     self._log_json(v, level + 1)
                 else:
-                    self._logger.debug(f"{indent}{k}: {v}")
+                    self._logger.debug(f"{indent}{k}: {format_log_value(k, v)}")
 
         elif isinstance(data, list):
             if level == 1:
-                self._logger.debug(f"{indent}Array({len(data)}) {data}")
-            if len(data) >= 1 and isinstance(data[0], (dict, list)):
-                if isinstance(data[0], dict):
-                    self._logger.debug(f"{indent}[0]:")
-                    self._log_json(data[0], level + 1)
+                self._logger.debug(f"{indent}Array({len(data)})")
+
+            for index, item in enumerate(data[:MAX_LOG_ITEMS]):
+                if isinstance(item, dict):
+                    if level >= MAX_LOG_DEPTH:
+                        keys = list(item.keys())
+                        sample_keys = ", ".join(
+                            str(key) for key in keys[:MAX_LOG_ITEMS]
+                        )
+                        suffix = ", ..." if len(keys) > MAX_LOG_ITEMS else ""
+                        self._logger.debug(
+                            f"{indent}[{index}]: Object({len(item)} keys"
+                            f"{f'; sample keys: {sample_keys}{suffix}' if keys else ''})"
+                        )
+                    else:
+                        self._logger.debug(f"{indent}[{index}]:")
+                        self._log_json(item, level + 1)
+                elif isinstance(item, list):
+                    self._logger.debug(f"{indent}[{index}]: Array({len(item)})")
+                    self._log_json(item, level + 1)
                 else:
-                    self._logger.debug(f"{indent}[0]: Array({len(data[0])}) {data[0]}")
-                    self._log_json(data[0], level + 1)
-                if len(data) >= 2:
-                    self._logger.debug(f"{indent}[1]: ... ({len(data)} items in all)")
+                    self._logger.debug(f"{indent}[{index}]: {format_log_value(index, item)}")
+
+            if len(data) > MAX_LOG_ITEMS:
+                self._logger.debug(
+                    f"{indent}[{MAX_LOG_ITEMS}]: ... ({len(data) - MAX_LOG_ITEMS} more items)"
+                )
 
         else:
-            self._logger.debug(f"{indent}{data}")
+            self._logger.debug(f"{indent}{format_log_value('', data)}")
 
     def _request(
         self,
@@ -98,9 +136,9 @@ class Client:
                 if key in ["params", "data", "headers"]:
                     self._logger.debug(f"  {key}:")
                     for k, v in value.items():
-                        self._logger.debug(f"    {k}: {v}")
+                        self._logger.debug(f"    {k}: {format_log_value(k, v)}")
                 elif not (key == "allow_redirects" and value is True):
-                    self._logger.debug(f"  {key}: {value}")
+                    self._logger.debug(f"  {key}: {format_log_value(key, value)}")
         self._logger.breathe()
 
         last_error: Exception | None = None
@@ -128,7 +166,7 @@ class Client:
         self._logger.debug(f"Response status: {resp.status_code}")
 
         try:
-            resp_json = resp.json()
+            resp_json = get_response_json(resp)
             self._logger.debug(f"Response JSON:")
             self._log_json(resp_json, 1)
         except Exception as e:
@@ -143,7 +181,8 @@ class Client:
         self._logger.debug(f"Session cookies:")
         for cookie in self.session.cookies:
             self._logger.debug(
-                f"  {cookie.name}: {cookie.value} (domain={cookie.domain}; path={cookie.path})"
+                f"  {cookie.name}: {format_log_value(cookie.name, cookie.value)} "
+                f"(domain={cookie.domain}; path={cookie.path})"
             )
         self._logger.breathe()
 
@@ -231,7 +270,7 @@ class EpeClient(Client):
             raise EpeUnavailableError(method, path)
 
         try:
-            resp_json = resp.json()
+            resp_json = get_response_json(resp)
         except Exception as e:
             raise Exception(f"Failed to parse response as JSON: {e}")
 
