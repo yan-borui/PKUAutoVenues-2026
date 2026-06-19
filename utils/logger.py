@@ -15,6 +15,7 @@ SENSITIVE_KEY_NAMES = {
     "pass2",
     "password",
     "phone",
+    "readkey",
     "secretkey",
     "sendkey",
     "sign",
@@ -29,7 +30,7 @@ COMPACT_KEY_PARTS = ("base64", "image")
 _KEY_VALUE_PATTERN = re.compile(
     r"(?i)\b("
     r"authorization|captchaToken|captchaVerification|cgAuthorization|email|pass2|"
-    r"password|phone|secretKey|sendkey|sign|sso-token|sso_pku_token|token|"
+    r"password|phone|readkey|secretKey|sendkey|sign|sso-token|sso_pku_token|token|"
     r"user|userName|username"
     r")(\s*[:=]\s*)([^\s,;)}\]]+)"
 )

@@ -95,6 +95,7 @@ class LoggingTests(unittest.TestCase):
             {
                 "password": "secret",
                 "imageBase64": "x" * 500,
+                "readkey": "SCT-secret-read-key",
                 "items": [
                     {"id": 1, "token": "abc"},
                     {"id": 2, "name": "second"},
@@ -107,6 +108,7 @@ class LoggingTests(unittest.TestCase):
         output = "\n".join(capture.messages)
         self.assertNotIn("secret", output)
         self.assertNotIn("abc", output)
+        self.assertNotIn("SCT-secret-read-key", output)
         self.assertIn("imageBase64: <500 chars>", output)
         self.assertIn("items: Array(3)", output)
         self.assertIn("[2]: ... (1 more items)", output)
