@@ -33,6 +33,7 @@ MAX_CAPTCHA_TURNS = 8
 RETURNED_SLOT_OFFSETS_MINUTES = (11, 12, 13)
 RESERVATION_INFO_URL = "https://epe.pku.edu.cn/venue-server/api/reservation/day/info"
 ReservationKey = tuple[str, tuple[tuple[str, str], ...]]
+PreferredSpaces = list[str] | dict[str, list[str]]
 AttemptResult = TypeVar("AttemptResult")
 
 
@@ -180,7 +181,7 @@ def find_reservation(
     venues: list[str],
     target_date: str,
     target_times: list[tuple[str, int]],
-    preferred_spaces: list[str],
+    preferred_spaces: PreferredSpaces,
     rejected_reservations: set[ReservationKey],
     logger: Logger,
 ) -> ReservationSelection | None:
@@ -197,7 +198,11 @@ def find_reservation(
             venue=venue,
             target_date=target_date,
             target_times=target_times,
-            preferred_spaces=preferred_spaces,
+            preferred_spaces=(
+                preferred_spaces.get(venue, [])
+                if isinstance(preferred_spaces, dict)
+                else preferred_spaces
+            ),
             rejected_reservations=rejected_reservations,
             logger=logger,
         )
@@ -301,7 +306,7 @@ def attempt_reservation(
     venues: list[str],
     target_date: str,
     target_times: list[tuple[str, int]],
-    preferred_spaces: list[str],
+    preferred_spaces: PreferredSpaces,
     rejected_reservations: set[ReservationKey],
     logger: Logger,
 ) -> ReservationResult:
@@ -502,7 +507,7 @@ def main(
     venues: list[str],
     target_date: str,
     target_times: list[tuple[str, int]],
-    preferred_spaces: list[str],
+    preferred_spaces: PreferredSpaces,
     skip_pay: bool,
     retry_returned_slots: bool,
 ):
@@ -786,6 +791,13 @@ if __name__ == "__main__":
         help="Preferred space names (optional), e.g. 4号 5 (abbr for 5号)",
     )
     parser.add_argument(
+        "--venue-spaces",
+        action="append",
+        default=[],
+        metavar="VENUE:SPACE[,SPACE...]",
+        help="Venue-specific preferred spaces, e.g. qdb:10,9,4. Overrides --spaces for that venue.",
+    )
+    parser.add_argument(
         "--skip-pay",
         action="store_true",
         help="Skip auto payment, need to manually pay within 10 minutes",
@@ -807,10 +819,9 @@ if __name__ == "__main__":
         "ws": "86",
         "五四": "86",
     }
-    venues = []
-    for venue_arg in args.venues:
+    def normalize_venue(venue_arg: str) -> str:
         if venue_arg in venue_aliases:
-            venue = venue_aliases[venue_arg]
+            return venue_aliases[venue_arg]
         else:
             try:
                 int(venue_arg)
@@ -818,7 +829,11 @@ if __name__ == "__main__":
                 parser.error(
                     f"Invalid -v/--venue item {venue_arg!r}: must be an alias or an integer"
                 )
-            venue = venue_arg
+            return venue_arg
+
+    venues = []
+    for venue_arg in args.venues:
+        venue = normalize_venue(venue_arg)
         if venue not in venues:
             venues.append(venue)
 
@@ -860,12 +875,33 @@ if __name__ == "__main__":
         target_times.append((begin_time, slots_count))
 
     # Process spaces
-    preferred_spaces = []
-    for s in args.spaces:
+    def normalize_space(space_arg: str) -> str:
         try:
-            preferred_spaces.append(f"{int(s)}号")
+            return f"{int(space_arg)}号"
         except ValueError:
-            preferred_spaces.append(s)
+            return space_arg
+
+    preferred_spaces: PreferredSpaces = []
+    for s in args.spaces:
+        preferred_spaces.append(normalize_space(s))
+
+    if args.venue_spaces:
+        preferred_spaces_by_venue = {
+            venue: list(preferred_spaces) for venue in venues if preferred_spaces
+        }
+        for item in args.venue_spaces:
+            if ":" not in item:
+                parser.error(
+                    f"Invalid --venue-spaces item {item!r}: must be VENUE:SPACE[,SPACE...]"
+                )
+            venue_arg, spaces_arg = item.split(":", 1)
+            venue = normalize_venue(venue_arg)
+            preferred_spaces_by_venue[venue] = [
+                normalize_space(space)
+                for space in spaces_arg.split(",")
+                if space
+            ]
+        preferred_spaces = preferred_spaces_by_venue
 
     main(
         venues=venues,

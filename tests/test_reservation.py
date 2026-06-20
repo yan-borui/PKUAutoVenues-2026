@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from main import find_reservation, select_reservation
 
@@ -154,6 +155,51 @@ class ReservationSelectionTests(unittest.TestCase):
         )
 
         self.assertEqual(selection.venue, "86")
+        self.assertEqual(client.requested_venues, ["60", "86"])
+
+    def test_venue_specific_spaces_apply_to_matching_venue(self):
+        client = FakeClient(
+            {
+                "60": reservation_info("1号", "9号"),
+                "86": reservation_info("2号"),
+            }
+        )
+
+        selection = find_reservation(
+            client=client,
+            venues=["60", "86"],
+            target_date=TARGET_DATE,
+            target_times=[("16:00", 1)],
+            preferred_spaces={"60": ["9号"]},
+            rejected_reservations=set(),
+            logger=self.logger,
+        )
+
+        self.assertEqual(selection.venue, "60")
+        self.assertEqual(selection.space, "9号")
+        self.assertEqual(client.requested_venues, ["60"])
+
+    def test_venue_specific_spaces_do_not_apply_to_fallback_venue(self):
+        client = FakeClient(
+            {
+                "60": reservation_info(),
+                "86": reservation_info("9号", "1号"),
+            }
+        )
+
+        with patch("main.random.choice", return_value="1号"):
+            selection = find_reservation(
+                client=client,
+                venues=["60", "86"],
+                target_date=TARGET_DATE,
+                target_times=[("16:00", 1)],
+                preferred_spaces={"60": ["9号"]},
+                rejected_reservations=set(),
+                logger=self.logger,
+            )
+
+        self.assertEqual(selection.venue, "86")
+        self.assertEqual(selection.space, "1号")
         self.assertEqual(client.requested_venues, ["60", "86"])
 
 
