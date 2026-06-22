@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import random
 from typing import Callable, TypeVar
+from zoneinfo import ZoneInfo
 
 from utils.client import (
     EpeAPIError,
@@ -299,6 +300,130 @@ def run_reservation_window(
     return None
 
 
+def run_with_transport_recovery(
+    action: Callable[[], AttemptResult],
+    retry_until: datetime,
+    label: str,
+    logger: Logger,
+    retry_delay: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] = lambda: datetime.now(ZoneInfo("Asia/Shanghai")),
+) -> AttemptResult:
+    while True:
+        try:
+            return action()
+        except (EpeUnavailableError, TransportUnavailableError) as e:
+            current_time = now()
+            if current_time >= retry_until:
+                raise
+
+            remaining = (retry_until - current_time).total_seconds()
+            delay = min(retry_delay, max(0.1, remaining))
+            logger.warning(
+                f"{label} paused by temporary network failure until retry: {e}"
+            )
+            logger.warning(f"Retrying {label} in {delay:.1f} seconds...")
+            logger.breathe()
+            sleep(delay)
+
+
+def login(client: EpeClient, logger: Logger) -> None:
+    # 1
+    client.get("https://epe.pku.edu.cn/venue-server/loginto")
+
+    # 2 (Optional?)
+    client.post(
+        "https://iaaa.pku.edu.cn/iaaa/oauth.jsp",
+        data={
+            "appID": "ty",
+            "appName": "北京大学体测系统",
+            "redirectUrl": "https://epe.pku.edu.cn/ggtypt/dologin",
+            "redirectLogonUrl": "https://epe.pku.edu.cn/ggtypt/dologin",
+        },
+    )
+
+    # 3
+    iaaa_resp = client.post(
+        "https://iaaa.pku.edu.cn/iaaa/oauthlogin.do",
+        data={
+            "appid": "ty",
+            "userName": CONFIG["iaaa"]["username"],
+            "password": encrypt_rsa(CONFIG["iaaa"]["password"]),
+            "randCode": "",
+            "smsCode": "",
+            "otpCode": "",
+            "remTrustChk": "false",
+            "redirUrl": "https://epe.pku.edu.cn/ggtypt/dologin",
+        },
+    )
+
+    try:
+        iaaa_json: dict = get_response_json(iaaa_resp)
+    except Exception as e:
+        raise Exception(f"Failed to parse IAAA response as JSON: {e}")
+
+    if iaaa_json.get("success") is True and "token" in iaaa_json:
+        iaaa_token = iaaa_json["token"]
+        logger.info(f"IAAA login successful")
+        logger.debug(f"IAAA token: {iaaa_token}")
+        logger.breathe()
+    else:
+        msg = iaaa_json.get("errors", {}).get("msg", "Unknown error")
+        raise Exception(f"IAAA login failed: {msg}")
+
+    # 4
+    client.get(
+        "https://epe.pku.edu.cn/ggtypt/dologin",
+        params={
+            "_rand": random.random(),
+            "token": iaaa_token,
+        },
+    )
+
+    # commonMethods.getToken()
+    sso_pku_token = client.session.cookies.get("sso_pku_token")
+
+    if sso_pku_token:
+        logger.info(f"GGTYPT login successful")
+        logger.debug(f"sso_pku_token: {sso_pku_token}")
+        logger.breathe()
+    else:
+        raise Exception(f"GGTYPT login failed: sso_pku_token cookie not found")
+
+    # 5
+    epe_login_data = client.epe_post(
+        "https://epe.pku.edu.cn/venue-server/api/login",
+        headers={
+            "sso-token": sso_pku_token,
+        },
+    )
+
+    if epe_login_data.get("token", {}).get("access_token", None):
+        # loginSuccess(), save as local storage (dataSix: e.token.access_token)
+        client.cg_auth_token = epe_login_data["token"]["access_token"]
+        logger.info(f"EPE login successful")
+        logger.debug(f"cg_auth_token: {client.cg_auth_token}")
+        logger.breathe()
+    else:
+        raise Exception(f"EPE login failed: access_token not found")
+
+    # 6 (Optional?)
+    role_login_data = client.epe_post(
+        "https://epe.pku.edu.cn/venue-server/roleLogin",
+        data={
+            "roleid": 3,
+        },
+    )
+
+    if role_login_data.get("token", {}).get("access_token", None):
+        client.cg_auth_token = role_login_data["token"]["access_token"]
+        logger.info(f"Role login successful")
+        logger.debug(f"cg_auth_token (with role info): {client.cg_auth_token}")
+        logger.breathe()
+    else:
+        raise Exception(f"Role login failed: access_token not found")
+
+
 def attempt_reservation(
     client: EpeClient,
     recognizer: Recognizer,
@@ -553,100 +678,14 @@ def main(
 
         wait_until(login_time, logger, "login", strict=False)
 
-        # 1
-        client.get("https://epe.pku.edu.cn/venue-server/loginto")
-
-        # 2 (Optional?)
-        client.post(
-            "https://iaaa.pku.edu.cn/iaaa/oauth.jsp",
-            data={
-                "appID": "ty",
-                "appName": "北京大学体测系统",
-                "redirectUrl": "https://epe.pku.edu.cn/ggtypt/dologin",
-                "redirectLogonUrl": "https://epe.pku.edu.cn/ggtypt/dologin",
-            },
+        windows = build_reservation_windows(release_time, retry_returned_slots)
+        login_retry_until = windows[-1].start_at + timedelta(minutes=1)
+        run_with_transport_recovery(
+            action=lambda: login(client, logger),
+            retry_until=login_retry_until,
+            label="login",
+            logger=logger,
         )
-
-        # 3
-        iaaa_resp = client.post(
-            "https://iaaa.pku.edu.cn/iaaa/oauthlogin.do",
-            data={
-                "appid": "ty",
-                "userName": CONFIG["iaaa"]["username"],
-                "password": encrypt_rsa(CONFIG["iaaa"]["password"]),
-                "randCode": "",
-                "smsCode": "",
-                "otpCode": "",
-                "remTrustChk": "false",
-                "redirUrl": "https://epe.pku.edu.cn/ggtypt/dologin",
-            },
-        )
-
-        try:
-            iaaa_json: dict = get_response_json(iaaa_resp)
-        except Exception as e:
-            raise Exception(f"Failed to parse IAAA response as JSON: {e}")
-
-        if iaaa_json.get("success") is True and "token" in iaaa_json:
-            iaaa_token = iaaa_json["token"]
-            logger.info(f"IAAA login successful")
-            logger.debug(f"IAAA token: {iaaa_token}")
-            logger.breathe()
-        else:
-            msg = iaaa_json.get("errors", {}).get("msg", "Unknown error")
-            raise Exception(f"IAAA login failed: {msg}")
-
-        # 4
-        client.get(
-            "https://epe.pku.edu.cn/ggtypt/dologin",
-            params={
-                "_rand": random.random(),
-                "token": iaaa_token,
-            },
-        )
-
-        # commonMethods.getToken()
-        sso_pku_token = client.session.cookies.get("sso_pku_token")
-
-        if sso_pku_token:
-            logger.info(f"GGTYPT login successful")
-            logger.debug(f"sso_pku_token: {sso_pku_token}")
-            logger.breathe()
-        else:
-            raise Exception(f"GGTYPT login failed: sso_pku_token cookie not found")
-
-        # 5
-        epe_login_data = client.epe_post(
-            "https://epe.pku.edu.cn/venue-server/api/login",
-            headers={
-                "sso-token": sso_pku_token,
-            },
-        )
-
-        if epe_login_data.get("token", {}).get("access_token", None):
-            # loginSuccess(), save as local storage (dataSix: e.token.access_token)
-            client.cg_auth_token = epe_login_data["token"]["access_token"]
-            logger.info(f"EPE login successful")
-            logger.debug(f"cg_auth_token: {client.cg_auth_token}")
-            logger.breathe()
-        else:
-            raise Exception(f"EPE login failed: access_token not found")
-
-        # 6 (Optional?)
-        role_login_data = client.epe_post(
-            "https://epe.pku.edu.cn/venue-server/roleLogin",
-            data={
-                "roleid": 3,
-            },
-        )
-
-        if role_login_data.get("token", {}).get("access_token", None):
-            client.cg_auth_token = role_login_data["token"]["access_token"]
-            logger.info(f"Role login successful")
-            logger.debug(f"cg_auth_token (with role info): {client.cg_auth_token}")
-            logger.breathe()
-        else:
-            raise Exception(f"Role login failed: access_token not found")
 
         """
         Loop: Recognize captcha, fetch reservation info, and submit order
@@ -656,8 +695,6 @@ def main(
         # an independent attempt budget.
         client_point_uid = f"point-{generate_uuid()}"
         reservation_result: ReservationResult | None = None
-        windows = build_reservation_windows(release_time, retry_returned_slots)
-
         for window in windows:
             wait_until(window.start_at, logger, window.label, strict=True)
             logger.info(
