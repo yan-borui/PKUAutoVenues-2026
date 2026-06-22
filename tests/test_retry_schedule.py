@@ -3,7 +3,12 @@ from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
-from main import build_reservation_windows, run_reservation_window, wait_for_epe
+from main import (
+    build_reservation_windows,
+    run_reservation_window,
+    run_with_transport_recovery,
+    wait_for_epe,
+)
 from utils.client import EpeClient, EpeUnavailableError, TransportUnavailableError
 
 
@@ -92,6 +97,58 @@ class RetryScheduleTests(unittest.TestCase):
 
         self.assertIsNone(actual)
         self.assertEqual(attempts, 2)
+
+    def test_transport_failure_retries_until_action_succeeds(self):
+        attempts = 0
+        sleeps = []
+        result = object()
+        now = datetime(2026, 6, 22, 11, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        def action():
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 2:
+                raise TransportUnavailableError(
+                    "GET",
+                    "https://epe.pku.edu.cn/venue-server/loginto",
+                    3,
+                    TimeoutError("timed out"),
+                )
+            return result
+
+        actual = run_with_transport_recovery(
+            action=action,
+            retry_until=now + timedelta(minutes=1),
+            label="login",
+            logger=self.logger,
+            sleep=sleeps.append,
+            now=lambda: now,
+        )
+
+        self.assertIs(actual, result)
+        self.assertEqual(attempts, 3)
+        self.assertEqual(sleeps, [1.0, 1.0])
+
+    def test_transport_recovery_does_not_retry_ordinary_errors(self):
+        attempts = 0
+        now = datetime(2026, 6, 22, 11, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        def action():
+            nonlocal attempts
+            attempts += 1
+            raise ValueError("bad credentials")
+
+        with self.assertRaisesRegex(ValueError, "bad credentials"):
+            run_with_transport_recovery(
+                action=action,
+                retry_until=now + timedelta(minutes=1),
+                label="login",
+                logger=self.logger,
+                sleep=lambda _seconds: None,
+                now=lambda: now,
+            )
+
+        self.assertEqual(attempts, 1)
 
     def test_default_schedule_gives_each_window_eight_attempts(self):
         release_time = datetime(2026, 6, 17, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
