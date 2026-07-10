@@ -1,13 +1,20 @@
 import time
 
-from .client import Client, get_response_json
+from .client import Client, TransportUnavailableError, get_response_json
 from .logger import Logger
 from .encrypt import md5_hash
 from .config import CONFIG
 
 
-class Recognizer:
+class CaptchaRecognitionTransportError(Exception):
+    """Raised when the external captcha recognition service is unavailable."""
 
+    def __init__(self, cause: TransportUnavailableError):
+        self.cause = cause
+        super().__init__(str(cause))
+
+
+class Recognizer:
     def __init__(self):
         self._method = CONFIG.get("recognize", "method", fallback="")
         self._client = Client(self._method)
@@ -48,17 +55,22 @@ class Recognizer:
         return result_list
 
     def _ttshitu(self, image_base64: str, words: list[str]) -> str:
-        resp = self._client.post(
-            "http://api.ttshitu.com/predict",
-            data={
-                "username": CONFIG["recognize:ttshitu"]["username"],
-                "password": CONFIG["recognize:ttshitu"]["password"],
-                "typeid": "43",  # 快速点选，http://www.ttshitu.com/news/9c2cae0531a147d2bafac3cd737109e7.html
-                "image": image_base64,
-                "content": "".join(words),
-            },
-            timeout=4.0,
-        )
+        try:
+            resp = self._client.post(
+                "http://api.ttshitu.com/predict",
+                data={
+                    "username": CONFIG["recognize:ttshitu"]["username"],
+                    "password": CONFIG["recognize:ttshitu"]["password"],
+                    "typeid": "43",  # 快速点选，http://www.ttshitu.com/news/9c2cae0531a147d2bafac3cd737109e7.html
+                    "image": image_base64,
+                    "content": "".join(words),
+                },
+                timeout=2.0,
+                max_attempts=1,
+            )
+        except TransportUnavailableError as e:
+            raise CaptchaRecognitionTransportError(e) from e
+
         return get_response_json(resp)["data"]["result"]
 
     def _chaojiying(self, image_base64: str, words: list[str]) -> str:

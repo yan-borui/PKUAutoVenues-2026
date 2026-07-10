@@ -10,6 +10,7 @@ from main import (
     wait_for_epe,
 )
 from utils.client import EpeClient, EpeUnavailableError, TransportUnavailableError
+from utils.recognize import CaptchaRecognitionTransportError
 
 
 class FakeLogger:
@@ -29,7 +30,9 @@ class RetryScheduleTests(unittest.TestCase):
 
     def test_http_502_is_typed_before_json_parsing(self):
         response = Mock(status_code=502)
-        response.json.side_effect = AssertionError("502 body must not be parsed as JSON")
+        response.json.side_effect = AssertionError(
+            "502 body must not be parsed as JSON"
+        )
         client = object.__new__(EpeClient)
         client.cg_auth_token = None
 
@@ -97,6 +100,41 @@ class RetryScheduleTests(unittest.TestCase):
 
         self.assertIsNone(actual)
         self.assertEqual(attempts, 2)
+
+    def test_captcha_service_timeout_retries_without_epe_heartbeat(self):
+        result = object()
+        attempts = 0
+        heartbeat_calls = 0
+
+        def attempt():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise CaptchaRecognitionTransportError(
+                    TransportUnavailableError(
+                        "POST",
+                        "http://api.ttshitu.com/predict",
+                        1,
+                        TimeoutError("timed out"),
+                    )
+                )
+            return result
+
+        def heartbeat():
+            nonlocal heartbeat_calls
+            heartbeat_calls += 1
+
+        actual = run_reservation_window(
+            attempt=attempt,
+            heartbeat=heartbeat,
+            max_attempts=1,
+            logger=self.logger,
+            sleep=lambda _seconds: None,
+        )
+
+        self.assertIs(actual, result)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(heartbeat_calls, 0)
 
     def test_transport_failure_retries_until_action_succeeds(self):
         attempts = 0

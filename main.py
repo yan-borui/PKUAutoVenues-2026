@@ -24,7 +24,7 @@ from utils.encrypt import (
     generate_uuid,
     generate_order_pin,
 )
-from utils.recognize import Recognizer
+from utils.recognize import CaptchaRecognitionTransportError, Recognizer
 from utils.notify import Notifier
 from utils.orders import extract_order_info, recover_unpaid_order
 from utils.time import get_next_weekday, get_release_time, wait_until
@@ -283,6 +283,13 @@ def run_reservation_window(
     while turn <= max_attempts:
         try:
             return attempt()
+        except CaptchaRecognitionTransportError as e:
+            logger.warning(
+                "Captcha recognition service unavailable; retrying with a new captcha: "
+                f"{e}"
+            )
+            logger.breathe()
+            continue
         except (EpeUnavailableError, TransportUnavailableError) as e:
             logger.warning(
                 f"Attempt {turn}/{max_attempts} paused without consuming its budget: {e}"
@@ -856,6 +863,7 @@ if __name__ == "__main__":
         "ws": "86",
         "五四": "86",
     }
+
     def normalize_venue(venue_arg: str) -> str:
         if venue_arg in venue_aliases:
             return venue_aliases[venue_arg]
@@ -934,9 +942,7 @@ if __name__ == "__main__":
             venue_arg, spaces_arg = item.split(":", 1)
             venue = normalize_venue(venue_arg)
             preferred_spaces_by_venue[venue] = [
-                normalize_space(space)
-                for space in spaces_arg.split(",")
-                if space
+                normalize_space(space) for space in spaces_arg.split(",") if space
             ]
         preferred_spaces = preferred_spaces_by_venue
 
