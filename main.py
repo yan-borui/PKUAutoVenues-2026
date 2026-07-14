@@ -15,27 +15,26 @@ from utils.client import (
     EpeClient,
     EpeUnavailableError,
     TransportUnavailableError,
-    get_response_json,
 )
+from utils.domain import (
+    AvailabilitySnapshot,
+    PreferredSpaces,
+    ReservationKey,
+    ReservationResult,
+    ReservationSelection,
+    ReservationTrade,
+)
+from utils.epe import EpeGateway, RESERVATION_INFO_URL, parse_availability
 from utils.logger import Logger
-from utils.encrypt import (
-    encrypt_rsa,
-    encrypt_aes_ecb,
-    generate_uuid,
-    generate_order_pin,
-)
+from utils.encrypt import generate_uuid
 from utils.recognize import CaptchaRecognitionTransportError, Recognizer
 from utils.notify import Notifier
-from utils.orders import extract_order_info, recover_unpaid_order
 from utils.time import get_next_weekday, get_release_time, wait_until
 from utils.config import CONFIG_FILE, LOGS_DIR, LOG_FILE
 from utils.settings import AppSettings, load_settings
 
 MAX_CAPTCHA_TURNS = 8
 RETURNED_SLOT_OFFSETS_MINUTES = (11, 12, 13)
-RESERVATION_INFO_URL = "https://epe.pku.edu.cn/venue-server/api/reservation/day/info"
-ReservationKey = tuple[str, tuple[tuple[str, str], ...]]
-PreferredSpaces = list[str] | dict[str, list[str]]
 AttemptResult = TypeVar("AttemptResult")
 
 
@@ -46,38 +45,8 @@ class ReservationWindow:
     label: str
 
 
-@dataclass(slots=True)
-class ReservationResult:
-    venue: str
-    space: str
-    selected_time: str
-    trade_no: str
-
-
-@dataclass(slots=True)
-class ReservationSelection:
-    venue: str
-    space: str
-    trades: list[dict]
-
-    @property
-    def key(self) -> ReservationKey:
-        return (
-            self.venue,
-            tuple((trade["spaceId"], trade["timeId"]) for trade in self.trades),
-        )
-
-    @property
-    def selected_time(self) -> str:
-        return f"{self.trades[0]['beginTime']}-{self.trades[-1]['endTime']}"
-
-    @property
-    def total_fee(self) -> int:
-        return sum(trade["orderFee"] for trade in self.trades)
-
-
 def select_reservation(
-    info_data: dict,
+    info_data: dict | AvailabilitySnapshot,
     venue: str,
     target_date: str,
     target_times: list[tuple[str, int]],
@@ -85,23 +54,20 @@ def select_reservation(
     rejected_reservations: set[ReservationKey],
     logger: Logger,
 ) -> ReservationSelection | None:
-    slots_info: list[dict] = sorted(
-        info_data.get("spaceTimeInfo", []),
-        key=lambda slot: slot["beginTime"],
+    snapshot = (
+        info_data
+        if isinstance(info_data, AvailabilitySnapshot)
+        else parse_availability(info_data)
     )
+    slots_info = sorted(snapshot.slots, key=lambda slot: slot.begin_time)
     begin_time_to_slot_idx: dict[str, int] = {
-        slot["beginTime"]: i for i, slot in enumerate(slots_info)
+        slot.begin_time: i for i, slot in enumerate(slots_info)
     }
-
-    res_date_space_info: dict[str, list[dict]] = info_data.get(
-        "reservationDateSpaceInfo", {}
-    )
-    if target_date not in res_date_space_info:
-        raise Exception(
+    if target_date not in snapshot.spaces_by_date:
+        raise ValueError(
             f"Target date {target_date} not found in reservationDateSpaceInfo"
         )
-
-    spaces_res_info = res_date_space_info[target_date]
+    spaces_res_info = snapshot.spaces_by_date[target_date]
 
     for begin_time, requested_slots_count in target_times:
         slots_count = requested_slots_count
@@ -121,35 +87,32 @@ def select_reservation(
 
         target_slots_info = slots_info[begin_slot_idx : begin_slot_idx + slots_count]
 
-        available_space_to_trades: dict[str, list[dict]] = {}
+        available_space_to_trades: dict[str, list[ReservationTrade]] = {}
         for space_res_info in spaces_res_info:
-            trades: list[dict] = [
-                space_res_info.get(str(slot["id"]), {}) for slot in target_slots_info
+            trades = [
+                space_res_info.trades_by_time_id.get(slot.id, {})
+                for slot in target_slots_info
             ]
             if not all(trade.get("reservationStatus") == 1 for trade in trades):
                 continue
 
             candidate_trades = [
-                {
-                    "timeId": str(slot["id"]),
-                    "beginTime": slot["beginTime"],
-                    "endTime": slot["endTime"],
-                    "spaceId": str(space_res_info["id"]),
-                    "spaceName": space_res_info["spaceName"],
-                    "orderFee": int(trade["orderFee"]),
-                }
+                ReservationTrade(
+                    time_id=slot.id,
+                    begin_time=slot.begin_time,
+                    end_time=slot.end_time,
+                    space_id=space_res_info.id,
+                    space_name=space_res_info.name,
+                    order_fee=int(trade["orderFee"]),
+                )
                 for slot, trade in zip(target_slots_info, trades)
             ]
             candidate_key: ReservationKey = (
                 venue,
-                tuple(
-                    (trade["spaceId"], trade["timeId"]) for trade in candidate_trades
-                ),
+                tuple((trade.space_id, trade.time_id) for trade in candidate_trades),
             )
             if candidate_key not in rejected_reservations:
-                available_space_to_trades[space_res_info["spaceName"]] = (
-                    candidate_trades
-                )
+                available_space_to_trades[space_res_info.name] = candidate_trades
 
         if not available_space_to_trades:
             logger.info(
@@ -179,7 +142,7 @@ def select_reservation(
 
 
 def find_reservation(
-    client: EpeClient,
+    client: EpeClient | EpeGateway,
     venues: list[str],
     target_date: str,
     target_times: list[tuple[str, int]],
@@ -188,13 +151,16 @@ def find_reservation(
     logger: Logger,
 ) -> ReservationSelection | None:
     for venue in venues:
-        info_data = client.epe_get(
-            RESERVATION_INFO_URL,
-            params={
-                "venueSiteId": venue,
-                "searchDate": target_date,
-            },
-        )
+        if isinstance(client, EpeGateway):
+            info_data = client.fetch_availability(venue, target_date)
+        else:
+            info_data = client.epe_get(
+                RESERVATION_INFO_URL,
+                params={
+                    "venueSiteId": venue,
+                    "searchDate": target_date,
+                },
+            )
         selection = select_reservation(
             info_data=info_data,
             venue=venue,
@@ -341,100 +307,7 @@ def login(
     settings: AppSettings | None = None,
 ) -> None:
     settings = settings or load_settings(CONFIG_FILE)
-    # 1
-    client.get("https://epe.pku.edu.cn/venue-server/loginto")
-
-    # 2 (Optional?)
-    client.post(
-        "https://iaaa.pku.edu.cn/iaaa/oauth.jsp",
-        data={
-            "appID": "ty",
-            "appName": "北京大学体测系统",
-            "redirectUrl": "https://epe.pku.edu.cn/ggtypt/dologin",
-            "redirectLogonUrl": "https://epe.pku.edu.cn/ggtypt/dologin",
-        },
-    )
-
-    # 3
-    iaaa_resp = client.post(
-        "https://iaaa.pku.edu.cn/iaaa/oauthlogin.do",
-        data={
-            "appid": "ty",
-            "userName": settings.iaaa.username,
-            "password": encrypt_rsa(settings.iaaa.password),
-            "randCode": "",
-            "smsCode": "",
-            "otpCode": "",
-            "remTrustChk": "false",
-            "redirUrl": "https://epe.pku.edu.cn/ggtypt/dologin",
-        },
-    )
-
-    try:
-        iaaa_json: dict = get_response_json(iaaa_resp)
-    except Exception as e:
-        raise Exception(f"Failed to parse IAAA response as JSON: {e}")
-
-    if iaaa_json.get("success") is True and "token" in iaaa_json:
-        iaaa_token = iaaa_json["token"]
-        logger.info(f"IAAA login successful")
-        logger.debug(f"IAAA token: {iaaa_token}")
-        logger.breathe()
-    else:
-        msg = iaaa_json.get("errors", {}).get("msg", "Unknown error")
-        raise Exception(f"IAAA login failed: {msg}")
-
-    # 4
-    client.get(
-        "https://epe.pku.edu.cn/ggtypt/dologin",
-        params={
-            "_rand": random.random(),
-            "token": iaaa_token,
-        },
-    )
-
-    # commonMethods.getToken()
-    sso_pku_token = client.session.cookies.get("sso_pku_token")
-
-    if sso_pku_token:
-        logger.info(f"GGTYPT login successful")
-        logger.debug(f"sso_pku_token: {sso_pku_token}")
-        logger.breathe()
-    else:
-        raise Exception(f"GGTYPT login failed: sso_pku_token cookie not found")
-
-    # 5
-    epe_login_data = client.epe_post(
-        "https://epe.pku.edu.cn/venue-server/api/login",
-        headers={
-            "sso-token": sso_pku_token,
-        },
-    )
-
-    if epe_login_data.get("token", {}).get("access_token", None):
-        # loginSuccess(), save as local storage (dataSix: e.token.access_token)
-        client.cg_auth_token = epe_login_data["token"]["access_token"]
-        logger.info(f"EPE login successful")
-        logger.debug(f"cg_auth_token: {client.cg_auth_token}")
-        logger.breathe()
-    else:
-        raise Exception(f"EPE login failed: access_token not found")
-
-    # 6 (Optional?)
-    role_login_data = client.epe_post(
-        "https://epe.pku.edu.cn/venue-server/roleLogin",
-        data={
-            "roleid": 3,
-        },
-    )
-
-    if role_login_data.get("token", {}).get("access_token", None):
-        client.cg_auth_token = role_login_data["token"]["access_token"]
-        logger.info(f"Role login successful")
-        logger.debug(f"cg_auth_token (with role info): {client.cg_auth_token}")
-        logger.breathe()
-    else:
-        raise Exception(f"Role login failed: access_token not found")
+    EpeGateway(client, settings, logger).authenticate()
 
 
 def attempt_reservation(
@@ -450,23 +323,10 @@ def attempt_reservation(
     settings: AppSettings | None = None,
 ) -> ReservationResult:
     settings = settings or load_settings(CONFIG_FILE)
-    get_captcha_data = client.epe_get(
-        "https://epe.pku.edu.cn/venue-server/api/captcha/get",
-        params={
-            "captchaType": "clickWord",
-            "clientUid": client_point_uid,
-            "ts": str(int(time.time() * 1000)),
-        },
-    )
-
-    if get_captcha_data.get("success") is not True:
-        raise Exception(f"Failed to get captcha: {get_captcha_data.get('repMsg')}")
-
-    rep_data = get_captcha_data["repData"]
-    image_base64 = rep_data["originalImageBase64"]
-    words = rep_data["wordList"]
-    captcha_token = rep_data["token"]
-    captcha_secret_key = rep_data["secretKey"]
+    gateway = EpeGateway(client, settings, logger)
+    challenge = gateway.issue_captcha(client_point_uid)
+    image_base64 = challenge.image_base64
+    words = challenge.words
 
     image_path = (
         LOGS_DIR / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')[:-3]}.png"
@@ -475,8 +335,8 @@ def attempt_reservation(
 
     logger.info(f"Captcha image saved to: {image_path}")
     logger.info(f"Words to click: {words}")
-    logger.debug(f"Captcha token: {captcha_token}")
-    logger.debug(f"Captcha secret key: {captcha_secret_key}")
+    logger.debug(f"Captcha token: {challenge.token}")
+    logger.debug(f"Captcha secret key: {challenge.secret_key}")
     logger.breathe()
 
     recognize_result = recognizer.recognize_captcha(image_base64, words)
@@ -485,27 +345,14 @@ def attempt_reservation(
         separators=(",", ":"),
     )
 
-    check_captcha_data = client.epe_post(
-        "https://epe.pku.edu.cn/venue-server/api/captcha/check",
-        data={
-            "captchaType": "clickWord",
-            "pointJson": encrypt_aes_ecb(recognized_points, captcha_secret_key),
-            "token": captcha_token,
-        },
-    )
-
-    if check_captcha_data.get("success") is not True:
-        raise Exception(
-            "Failed to pass captcha check, maybe the recognition is wrong: "
-            f"{check_captcha_data.get('repMsg')}"
-        )
+    gateway.verify_captcha(challenge, recognized_points)
 
     captcha_verified_at = time.perf_counter()
     logger.info("Captcha verified successfully!")
     logger.breathe()
 
     selection = find_reservation(
-        client=client,
+        client=gateway,
         venues=venues,
         target_date=target_date,
         target_times=target_times,
@@ -539,33 +386,12 @@ def attempt_reservation(
         time.sleep(1 - elapsed)
 
     try:
-        submit_data = client.epe_post(
-            "https://epe.pku.edu.cn/venue-server/api/reservation/order/submit",
-            data={
-                "captchaVerification": encrypt_aes_ecb(
-                    captcha_token + "---" + recognized_points,
-                    captcha_secret_key,
-                ),
-                "captchaToken": captcha_token,
-                "reservationOrderJson": json.dumps(
-                    [
-                        {"spaceId": trade["spaceId"], "timeId": trade["timeId"]}
-                        for trade in selected_trades
-                    ],
-                    separators=(",", ":"),
-                ),
-                "reservationDate": target_date,
-                "weekStartDate": target_date,
-                "reservationType": "-1",
-                "orderPrice": total_fee,
-                "orderPin": generate_order_pin(),
-                "venueSiteId": selected_venue,
-                "phone": settings.epe.phone,
-            },
-            # Retrying a timed-out submit can create a duplicate order.
-            max_attempts=1,
+        order_info = gateway.submit_order(
+            selection=selection,
+            target_date=target_date,
+            points_json=recognized_points,
+            challenge=challenge,
         )
-        order_info = extract_order_info(submit_data)
 
     except Exception as submit_error:
         if (
@@ -585,21 +411,19 @@ def attempt_reservation(
 
         while True:
             try:
-                order_info = recover_unpaid_order(
-                    client,
+                order_info = gateway.find_unpaid_order(
                     venue=selected_venue,
                     target_date=target_date,
                     selected_space=selected_space,
-                    begin_time=selected_trades[0]["beginTime"],
+                    begin_time=selected_trades[0].begin_time,
                 )
 
                 if order_info is None and "未支付的订单" in str(submit_error):
-                    order_info = recover_unpaid_order(
-                        client,
+                    order_info = gateway.find_unpaid_order(
                         venue=selected_venue,
                         target_date=target_date,
                         selected_space=None,
-                        begin_time=selected_trades[0]["beginTime"],
+                        begin_time=selected_trades[0].begin_time,
                     )
                 break
             except (EpeUnavailableError, TransportUnavailableError):
@@ -613,12 +437,12 @@ def attempt_reservation(
         if order_info is None:
             raise submit_error
 
-        recovered_space = order_info.get("venueSpaceName")
+        recovered_space = order_info.venue_space_name
         if recovered_space:
             selected_space = str(recovered_space)
 
-        recovered_start = str(order_info.get("reservationStartDate", ""))
-        recovered_end = str(order_info.get("reservationEndDate", ""))
+        recovered_start = order_info.reservation_start_date or ""
+        recovered_end = order_info.reservation_end_date or ""
         if len(recovered_start) >= 5 and len(recovered_end) >= 5:
             selected_time = f"{recovered_start[-5:]}-{recovered_end[-5:]}"
 
@@ -626,8 +450,8 @@ def attempt_reservation(
             f"Recovered matching unpaid order: {selected_time} {selected_space}场地"
         )
 
-    trade_id = order_info.get("id")
-    trade_no = order_info["tradeNo"]
+    trade_id = order_info.id
+    trade_no = order_info.trade_no
     logger.info(
         "Successfully submitted reservation order"
         f"{f' (ID: {trade_id})' if trade_id else ''}"
@@ -684,6 +508,7 @@ def main(
     logger.breathe()
 
     client = EpeClient("epe")
+    gateway = EpeGateway(client, settings, logger)
     recognizer = Recognizer(settings.recognition)
     notifier = Notifier(settings.notification)
 
@@ -697,7 +522,7 @@ def main(
         windows = build_reservation_windows(release_time, retry_returned_slots)
         login_retry_until = windows[-1].start_at + timedelta(minutes=1)
         run_with_transport_recovery(
-            action=lambda: login(client, logger, settings),
+            action=gateway.authenticate,
             retry_until=login_retry_until,
             label="login",
             logger=logger,
@@ -775,13 +600,7 @@ def main(
             return
 
         try:
-            pay_data = client.epe_post(
-                "https://epe.pku.edu.cn/venue-server/api/venue/finances/order/pay",
-                data={"payType": "1", "venueTradeNo": trade_no, "isApp": "0"},
-            )
-            pay_fee = pay_data.get("payFee")
-            if not pay_fee:
-                raise Exception(f"payFee not found in pay response")
+            pay_fee = gateway.pay(trade_no).fee
 
             logger.info(
                 f"Successfully paid CNY {pay_fee} for the reservation order with campus card"
