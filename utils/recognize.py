@@ -1,9 +1,10 @@
 import time
 
 from .client import Client, TransportUnavailableError, get_response_json
+from .config import CONFIG_FILE
 from .logger import Logger
 from .encrypt import md5_hash
-from .config import CONFIG
+from .settings import RecognitionSettings, load_settings
 
 
 class CaptchaRecognitionTransportError(Exception):
@@ -15,10 +16,16 @@ class CaptchaRecognitionTransportError(Exception):
 
 
 class Recognizer:
-    def __init__(self):
-        self._method = CONFIG.get("recognize", "method", fallback="")
-        self._client = Client(self._method)
-        self._logger = Logger("recognizer")
+    def __init__(
+        self,
+        settings: RecognitionSettings | None = None,
+        client: Client | None = None,
+        logger: Logger | None = None,
+    ):
+        self._settings = settings or load_settings(CONFIG_FILE).recognition
+        self._method = self._settings.method
+        self._client = client or Client(self._method)
+        self._logger = logger or Logger("recognizer")
 
     def recognize_captcha(
         self, image_base64: str, words: list[str]
@@ -55,12 +62,15 @@ class Recognizer:
         return result_list
 
     def _ttshitu(self, image_base64: str, words: list[str]) -> str:
+        settings = getattr(self, "_settings", None)
+        if settings is None:
+            settings = load_settings(CONFIG_FILE).recognition
         try:
             resp = self._client.post(
                 "http://api.ttshitu.com/predict",
                 data={
-                    "username": CONFIG["recognize:ttshitu"]["username"],
-                    "password": CONFIG["recognize:ttshitu"]["password"],
+                    "username": settings.username,
+                    "password": settings.password,
                     "typeid": "43",  # 快速点选，http://www.ttshitu.com/news/9c2cae0531a147d2bafac3cd737109e7.html
                     "image": image_base64,
                     "content": "".join(words),
@@ -74,12 +84,15 @@ class Recognizer:
         return get_response_json(resp)["data"]["result"]
 
     def _chaojiying(self, image_base64: str, words: list[str]) -> str:
+        settings = self._settings
+        if settings.softid is None:
+            raise ValueError("Chaojiying softid is required")
         resp = self._client.post(
             "https://upload.chaojiying.net/Upload/Processing.php",
             data={
-                "user": CONFIG["recognize:chaojiying"]["username"],
-                "pass2": md5_hash(CONFIG["recognize:chaojiying"]["password"]),
-                "softid": CONFIG["recognize:chaojiying"]["softid"],
+                "user": settings.username,
+                "pass2": md5_hash(settings.password),
+                "softid": settings.softid,
                 "codetype": "9801",
                 "str_debug": f"{{8a:{','.join(words)}/8a}}",
                 "file_base64": image_base64,

@@ -28,7 +28,8 @@ from utils.recognize import CaptchaRecognitionTransportError, Recognizer
 from utils.notify import Notifier
 from utils.orders import extract_order_info, recover_unpaid_order
 from utils.time import get_next_weekday, get_release_time, wait_until
-from utils.config import LOGS_DIR, LOG_FILE, CONFIG
+from utils.config import CONFIG_FILE, LOGS_DIR, LOG_FILE
+from utils.settings import AppSettings, load_settings
 
 MAX_CAPTCHA_TURNS = 8
 RETURNED_SLOT_OFFSETS_MINUTES = (11, 12, 13)
@@ -334,7 +335,12 @@ def run_with_transport_recovery(
             sleep(delay)
 
 
-def login(client: EpeClient, logger: Logger) -> None:
+def login(
+    client: EpeClient,
+    logger: Logger,
+    settings: AppSettings | None = None,
+) -> None:
+    settings = settings or load_settings(CONFIG_FILE)
     # 1
     client.get("https://epe.pku.edu.cn/venue-server/loginto")
 
@@ -354,8 +360,8 @@ def login(client: EpeClient, logger: Logger) -> None:
         "https://iaaa.pku.edu.cn/iaaa/oauthlogin.do",
         data={
             "appid": "ty",
-            "userName": CONFIG["iaaa"]["username"],
-            "password": encrypt_rsa(CONFIG["iaaa"]["password"]),
+            "userName": settings.iaaa.username,
+            "password": encrypt_rsa(settings.iaaa.password),
             "randCode": "",
             "smsCode": "",
             "otpCode": "",
@@ -441,7 +447,9 @@ def attempt_reservation(
     preferred_spaces: PreferredSpaces,
     rejected_reservations: set[ReservationKey],
     logger: Logger,
+    settings: AppSettings | None = None,
 ) -> ReservationResult:
+    settings = settings or load_settings(CONFIG_FILE)
     get_captcha_data = client.epe_get(
         "https://epe.pku.edu.cn/venue-server/api/captcha/get",
         params={
@@ -552,7 +560,7 @@ def attempt_reservation(
                 "orderPrice": total_fee,
                 "orderPin": generate_order_pin(),
                 "venueSiteId": selected_venue,
-                "phone": CONFIG["epe"]["phone"],
+                "phone": settings.epe.phone,
             },
             # Retrying a timed-out submit can create a duplicate order.
             max_attempts=1,
@@ -643,6 +651,7 @@ def main(
     skip_pay: bool,
     retry_returned_slots: bool,
 ):
+    settings = load_settings(CONFIG_FILE)
     logger = Logger("main")
     logger.info(f"Running: {' '.join(sys.argv)}")
     logger.breathe()
@@ -675,8 +684,8 @@ def main(
     logger.breathe()
 
     client = EpeClient("epe")
-    recognizer = Recognizer()
-    notifier = Notifier()
+    recognizer = Recognizer(settings.recognition)
+    notifier = Notifier(settings.notification)
 
     try:
         """
@@ -688,7 +697,7 @@ def main(
         windows = build_reservation_windows(release_time, retry_returned_slots)
         login_retry_until = windows[-1].start_at + timedelta(minutes=1)
         run_with_transport_recovery(
-            action=lambda: login(client, logger),
+            action=lambda: login(client, logger, settings),
             retry_until=login_retry_until,
             label="login",
             logger=logger,
@@ -722,6 +731,7 @@ def main(
                     preferred_spaces=preferred_spaces,
                     rejected_reservations=rejected_reservations,
                     logger=logger,
+                    settings=settings,
                 ),
                 heartbeat=lambda: wait_for_epe(
                     client=client,

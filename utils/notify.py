@@ -4,16 +4,22 @@ from email.mime.text import MIMEText
 from email.utils import formataddr
 
 from .client import Client, get_response_json
+from .config import CONFIG_FILE
 from .logger import Logger
-from .config import CONFIG
+from .settings import NotificationSettings, load_settings
 
 
 class Notifier:
-
-    def __init__(self):
-        self._method = CONFIG.get("notify", "method", fallback="")
-        self._client = Client(self._method)
-        self._logger = Logger("notifier")
+    def __init__(
+        self,
+        settings: NotificationSettings | None = None,
+        client: Client | None = None,
+        logger: Logger | None = None,
+    ):
+        self._settings = settings or load_settings(CONFIG_FILE).notification
+        self._method = self._settings.method
+        self._client = client or Client(self._method)
+        self._logger = logger or Logger("notifier")
 
     def notify_message(self, title: str, content: str) -> bool:
         """成功返回 True，失败返回 False，never raise Exception，不打断主流程"""
@@ -55,8 +61,10 @@ class Notifier:
     """
 
     def _email(self, title: str, content: str):
-        email = CONFIG["notify:email"]["email"]
-        password = CONFIG["notify:email"]["password"]
+        email = self._settings.email
+        password = self._settings.password
+        if email is None or password is None:
+            raise ValueError("Email notification credentials are required")
 
         domain = email.split("@")[-1]
         if domain == "stu.pku.edu.cn":
@@ -84,7 +92,9 @@ class Notifier:
             )
 
     def _sc3(self, title: str, content: str):
-        sendkey = CONFIG["notify:sc3"]["sendkey"]
+        sendkey = self._settings.sendkey
+        if sendkey is None:
+            raise ValueError("SC3 sendkey is required")
 
         match = re.match(r"^sctp(\d+)t", sendkey)
         if match is None:
@@ -112,7 +122,9 @@ class Notifier:
             )
 
     def _sct(self, title: str, content: str):
-        sendkey = CONFIG["notify:sct"]["sendkey"]
+        sendkey = self._settings.sendkey
+        if sendkey is None:
+            raise ValueError("SCT sendkey is required")
 
         response = self._client.post(
             f"https://sctapi.ftqq.com/{sendkey}.send",
@@ -138,7 +150,9 @@ class Notifier:
                 )
 
     def _bark(self, title: str, content: str):
-        sendkey = CONFIG["notify:bark"]["sendkey"]
+        sendkey = self._settings.sendkey
+        if sendkey is None:
+            raise ValueError("Bark sendkey is required")
 
         response = self._client.post(
             f"https://api.day.app/{sendkey}",

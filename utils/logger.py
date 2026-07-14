@@ -79,10 +79,11 @@ def sanitize_log_message(msg: str) -> str:
 
 
 class Logger:
-
     def __init__(self, name: str):
         self._logger = logging.getLogger(name)
         self._logger.setLevel(logging.DEBUG)
+
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
         formatter = logging.Formatter(
             "%(asctime)s [%(levelname)s] (%(name)s) %(message)s",
