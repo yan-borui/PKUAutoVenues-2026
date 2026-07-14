@@ -1,9 +1,10 @@
 import time
+from typing import Protocol
 
 from .client import Client, TransportUnavailableError, get_response_json
 from .config import CONFIG_FILE
-from .logger import Logger
 from .encrypt import md5_hash
+from .logger import Logger
 from .settings import RecognitionSettings, load_settings
 
 
@@ -15,88 +16,174 @@ class CaptchaRecognitionTransportError(Exception):
         super().__init__(str(cause))
 
 
-class Recognizer:
-    def __init__(
-        self,
-        settings: RecognitionSettings | None = None,
-        client: Client | None = None,
-        logger: Logger | None = None,
-    ):
-        self._settings = settings or load_settings(CONFIG_FILE).recognition
-        self._method = self._settings.method
-        self._client = client or Client(self._method)
-        self._logger = logger or Logger("recognizer")
+class CaptchaRecognizer(Protocol):
+    def recognize_captcha(
+        self, image_base64: str, words: list[str]
+    ) -> list[tuple[int, int]]: ...
+
+
+class BaseRecognizer:
+    method: str
+
+    def __init__(self, client: Client, logger: Logger) -> None:
+        self._client = client
+        self._logger = logger
 
     def recognize_captcha(
         self, image_base64: str, words: list[str]
     ) -> list[tuple[int, int]]:
         start = time.perf_counter()
-
-        if self._method == "ttshitu":
-            result = self._ttshitu(image_base64, words)
-        elif self._method == "chaojiying":
-            result = self._chaojiying(image_base64, words)
-        else:
-            raise Exception(
-                "Invalid recognition method, must be 'ttshitu' or 'chaojiying'"
-            )
-
+        result = self._recognize(image_base64, words)
         elapsed = time.perf_counter() - start
         self._logger.info(
-            f"Recognized captcha by {self._method} in {elapsed:.2f} seconds: {result}"
+            f"Recognized captcha by {self.method} in {elapsed:.2f} seconds: {result}"
         )
         self._logger.breathe()
 
-        # "234,47|168,90|101,63" -> [(234, 47), (168, 90), (101, 63)]
-        result_list = [
-            (int(item.split(",")[0]), int(item.split(",")[1]))
-            for item in result.split("|")
-        ]
-
-        if len(result_list) != len(words):
-            # 认为是这个 case 超出模型的识别能力，重试可能没用，直接 raise Exception 让主流程换一张图片
-            raise Exception(
-                f"The number of recognized coordinates ({len(result_list)}) does not match the number of words ({len(words)})"
-            )
-
-        return result_list
-
-    def _ttshitu(self, image_base64: str, words: list[str]) -> str:
-        settings = getattr(self, "_settings", None)
-        if settings is None:
-            settings = load_settings(CONFIG_FILE).recognition
         try:
-            resp = self._client.post(
+            points = [
+                (int(item.split(",")[0]), int(item.split(",")[1]))
+                for item in result.split("|")
+            ]
+        except (IndexError, ValueError) as error:
+            raise ValueError(
+                f"Invalid coordinate response from {self.method}: {result!r}"
+            ) from error
+        if len(points) != len(words):
+            raise ValueError(
+                f"The number of recognized coordinates ({len(points)}) does not match the number of words ({len(words)})"
+            )
+        return points
+
+    def _recognize(self, image_base64: str, words: list[str]) -> str:
+        raise NotImplementedError
+
+
+class TTShituRecognizer(BaseRecognizer):
+    method = "ttshitu"
+
+    def __init__(
+        self,
+        settings: RecognitionSettings,
+        client: Client,
+        logger: Logger,
+    ) -> None:
+        super().__init__(client, logger)
+        self._settings = settings
+
+    def _recognize(self, image_base64: str, words: list[str]) -> str:
+        try:
+            response = self._client.post(
                 "http://api.ttshitu.com/predict",
                 data={
-                    "username": settings.username,
-                    "password": settings.password,
-                    "typeid": "43",  # 快速点选，http://www.ttshitu.com/news/9c2cae0531a147d2bafac3cd737109e7.html
+                    "username": self._settings.username,
+                    "password": self._settings.password,
+                    "typeid": "43",
                     "image": image_base64,
                     "content": "".join(words),
                 },
                 timeout=2.0,
                 max_attempts=1,
             )
-        except TransportUnavailableError as e:
-            raise CaptchaRecognitionTransportError(e) from e
+        except TransportUnavailableError as error:
+            raise CaptchaRecognitionTransportError(error) from error
+        return get_response_json(response)["data"]["result"]
 
-        return get_response_json(resp)["data"]["result"]
 
-    def _chaojiying(self, image_base64: str, words: list[str]) -> str:
-        settings = self._settings
+class ChaojiyingRecognizer(BaseRecognizer):
+    method = "chaojiying"
+
+    def __init__(
+        self,
+        settings: RecognitionSettings,
+        client: Client,
+        logger: Logger,
+    ) -> None:
         if settings.softid is None:
             raise ValueError("Chaojiying softid is required")
-        resp = self._client.post(
+        super().__init__(client, logger)
+        self._settings = settings
+
+    def _recognize(self, image_base64: str, words: list[str]) -> str:
+        response = self._client.post(
             "https://upload.chaojiying.net/Upload/Processing.php",
             data={
-                "user": settings.username,
-                "pass2": md5_hash(settings.password),
-                "softid": settings.softid,
+                "user": self._settings.username,
+                "pass2": md5_hash(self._settings.password),
+                "softid": self._settings.softid,
                 "codetype": "9801",
                 "str_debug": f"{{8a:{','.join(words)}/8a}}",
                 "file_base64": image_base64,
             },
             timeout=4.0,
         )
-        return get_response_json(resp)["pic_str"]
+        return get_response_json(response)["pic_str"]
+
+
+def create_recognizer(
+    settings: RecognitionSettings,
+    client: Client | None = None,
+    logger: Logger | None = None,
+) -> CaptchaRecognizer:
+    adapter_types = {
+        "ttshitu": TTShituRecognizer,
+        "chaojiying": ChaojiyingRecognizer,
+    }
+    try:
+        adapter_type = adapter_types[settings.method]
+    except KeyError as error:
+        raise ValueError(
+            f"Unsupported recognition method: {settings.method}"
+        ) from error
+    return adapter_type(
+        settings,
+        client or Client(settings.method),
+        logger or Logger("recognizer"),
+    )
+
+
+class Recognizer:
+    """Compatibility facade; new code should use create_recognizer()."""
+
+    def __init__(
+        self,
+        settings: RecognitionSettings | None = None,
+        client: Client | None = None,
+        logger: Logger | None = None,
+    ) -> None:
+        settings = settings or load_settings(CONFIG_FILE).recognition
+        self._settings = settings
+        self._client = client or Client(settings.method)
+        self._logger = logger or Logger("recognizer")
+        self._adapter = create_recognizer(
+            settings,
+            client=self._client,
+            logger=self._logger,
+        )
+
+    def recognize_captcha(
+        self, image_base64: str, words: list[str]
+    ) -> list[tuple[int, int]]:
+        return self._adapter.recognize_captcha(image_base64, words)
+
+    def _ttshitu(self, image_base64: str, words: list[str]) -> str:
+        settings = getattr(self, "_settings", None)
+        if settings is None:
+            settings = load_settings(CONFIG_FILE).recognition
+        logger = getattr(self, "_logger", None)
+        if logger is None:
+            logger = Logger("recognizer")
+        adapter = TTShituRecognizer(
+            settings,
+            self._client,
+            logger,
+        )
+        return adapter._recognize(image_base64, words)
+
+    def _chaojiying(self, image_base64: str, words: list[str]) -> str:
+        adapter = ChaojiyingRecognizer(
+            self._settings,
+            self._client,
+            self._logger,
+        )
+        return adapter._recognize(image_base64, words)

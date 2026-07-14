@@ -2,6 +2,7 @@ import re
 import smtplib
 from email.mime.text import MIMEText
 from email.utils import formataddr
+from typing import Protocol
 
 from .client import Client, get_response_json
 from .config import CONFIG_FILE
@@ -9,165 +10,215 @@ from .logger import Logger
 from .settings import NotificationSettings, load_settings
 
 
-class Notifier:
-    def __init__(
-        self,
-        settings: NotificationSettings | None = None,
-        client: Client | None = None,
-        logger: Logger | None = None,
-    ):
-        self._settings = settings or load_settings(CONFIG_FILE).notification
-        self._method = self._settings.method
-        self._client = client or Client(self._method)
-        self._logger = logger or Logger("notifier")
+class NotificationAdapter(Protocol):
+    method: str
 
-    def notify_message(self, title: str, content: str) -> bool:
-        """成功返回 True，失败返回 False，never raise Exception，不打断主流程"""
+    def send(self, title: str, content: str) -> None: ...
 
-        if self._method == "none":
-            self._logger.warning(
-                f"Notification method is 'none', skipping notification: {title}"
-            )
-            self._logger.breathe()
-            return True
 
-        try:
-            if self._method == "email":
-                self._email(title, content)
-            elif self._method == "sc3":
-                self._sc3(title, content)
-            elif self._method == "sct":
-                self._sct(title, content)
-            elif self._method == "bark":
-                self._bark(title, content)
-            else:
-                raise Exception(
-                    "Invalid notification method, must be 'email', 'sc3', 'sct', 'bark' or 'none'"
-                )
+class NullNotificationAdapter:
+    method = "none"
 
-            self._logger.info(f"Sent a notification message by {self._method}: {title}")
-            self._logger.breathe()
-            return True
+    def send(self, title: str, content: str) -> None:
+        return None
 
-        except Exception as e:
-            self._logger.error(
-                f"Failed to send the notification message by {self._method}: ({e.__class__.__name__}) {e}"
-            )
-            self._logger.breathe()
-            return False
 
-    """
-    以下各种通知方法，通知失败会 raise Exception
-    """
+class EmailNotificationAdapter:
+    method = "email"
 
-    def _email(self, title: str, content: str):
-        email = self._settings.email
-        password = self._settings.password
-        if email is None or password is None:
-            raise ValueError("Email notification credentials are required")
+    def __init__(self, email: str, password: str) -> None:
+        self.email = email
+        self.password = password
 
-        domain = email.split("@")[-1]
+    def send(self, title: str, content: str) -> None:
+        domain = self.email.split("@")[-1]
         if domain == "stu.pku.edu.cn":
             host = "smtphz.qiye.163.com"
         elif domain in {"pku.edu.cn", "qq.com", "163.com", "126.com"}:
             host = f"smtp.{domain}"
         else:
-            raise Exception(
+            raise ValueError(
                 "Unsupported email address, must end with '@stu.pku.edu.cn', '@pku.edu.cn', '@qq.com', '@163.com' or '@126.com'"
             )
 
         message = MIMEText(content, "plain")
-        message["From"] = formataddr(("PKUAutoVenues", email))
-        message["To"] = email
+        message["From"] = formataddr(("PKUAutoVenues", self.email))
+        message["To"] = self.email
         message["Subject"] = title
-
         try:
             server = smtplib.SMTP_SSL(host, port=465)
-            server.login(email, password)
-            server.sendmail(email, email, message.as_string())
+            server.login(self.email, self.password)
+            server.sendmail(self.email, self.email, message.as_string())
             server.quit()
-        except Exception as e:
-            raise Exception(
-                f"Maybe the email address or password (authorization code) is incorrect: ({e.__class__.__name__}) {e}"
-            )
+        except Exception as error:
+            raise RuntimeError(
+                "Maybe the email address or password (authorization code) is incorrect: "
+                f"({error.__class__.__name__}) {error}"
+            ) from error
 
-    def _sc3(self, title: str, content: str):
-        sendkey = self._settings.sendkey
-        if sendkey is None:
-            raise ValueError("SC3 sendkey is required")
 
+class SC3NotificationAdapter:
+    method = "sc3"
+
+    def __init__(self, sendkey: str, client: Client) -> None:
         match = re.match(r"^sctp(\d+)t", sendkey)
         if match is None:
-            raise Exception(
+            raise ValueError(
                 "Invalid SC3 sendkey, must follow a format like 'sctp<number>t...'"
             )
-        uid = match.group(1)
+        self.sendkey = sendkey
+        self.uid = match.group(1)
+        self.client = client
 
-        response = self._client.post(
-            f"https://{uid}.push.ft07.com/send/{sendkey}.send",
+    def send(self, title: str, content: str) -> None:
+        response = self.client.post(
+            f"https://{self.uid}.push.ft07.com/send/{self.sendkey}.send",
             data={
                 "title": title,
-                "desp": content.replace("\n", "\n\n"),  # Markdown
-                "short": content,  # 推送消息卡片的内容，这里直接提供原始消息内容，显示时会截取前若干个字符作为预览
+                "desp": content.replace("\n", "\n\n"),
+                "short": content,
                 "tags": "PKUAutoVenues",
             },
             timeout=60.0,
         )
-
-        response_data = get_response_json(response)
-
-        if response_data["code"] != 0:
-            raise Exception(
-                f"Maybe the SC3 sendkey is incorrect: ({response_data['code']}) {response_data.get('error')}"
+        data = get_response_json(response)
+        if data["code"] != 0:
+            raise RuntimeError(
+                f"Maybe the SC3 sendkey is incorrect: ({data['code']}) {data.get('error')}"
             )
 
-    def _sct(self, title: str, content: str):
-        sendkey = self._settings.sendkey
-        if sendkey is None:
-            raise ValueError("SCT sendkey is required")
 
-        response = self._client.post(
-            f"https://sctapi.ftqq.com/{sendkey}.send",
+class SCTNotificationAdapter:
+    method = "sct"
+
+    def __init__(self, sendkey: str, client: Client) -> None:
+        self.sendkey = sendkey
+        self.client = client
+
+    def send(self, title: str, content: str) -> None:
+        response = self.client.post(
+            f"https://sctapi.ftqq.com/{self.sendkey}.send",
             data={
                 "title": title,
-                "desp": content.replace("\n", "\n\n"),  # Markdown
-                "noip": "1",  # 隐藏调用 IP
-                "channel": "9",  # 指定消息通道为方糖服务号
+                "desp": content.replace("\n", "\n\n"),
+                "noip": "1",
+                "channel": "9",
             },
             timeout=60.0,
         )
+        data = get_response_json(response)
+        if data["code"] == 40001 and data.get("scode") == 471:
+            raise RuntimeError(
+                f"SCT exceeded daily sending frequency limit: {data.get('message')}"
+            )
+        if data["code"] != 0:
+            raise RuntimeError(
+                f"Maybe the SCT sendkey is incorrect: ({data['code']}) {data.get('message')}"
+            )
 
-        response_data = get_response_json(response)
 
-        if response_data["code"] != 0:
-            if response_data["code"] == 40001 and response_data.get("scode") == 471:
-                raise Exception(
-                    f"SCT exceeded daily sending frequency limit: {response_data.get('message')}"
-                )
-            else:
-                raise Exception(
-                    f"Maybe the SCT sendkey is incorrect: ({response_data['code']}) {response_data.get('message')}"
-                )
+class BarkNotificationAdapter:
+    method = "bark"
 
-    def _bark(self, title: str, content: str):
-        sendkey = self._settings.sendkey
-        if sendkey is None:
-            raise ValueError("Bark sendkey is required")
+    def __init__(self, sendkey: str, client: Client) -> None:
+        self.sendkey = sendkey
+        self.client = client
 
-        response = self._client.post(
-            f"https://api.day.app/{sendkey}",
+    def send(self, title: str, content: str) -> None:
+        response = self.client.post(
+            f"https://api.day.app/{self.sendkey}",
             data={
                 "title": title,
                 "body": content,
                 "group": "PKUAutoVenues",
-                "badge": "1",  # 角标提醒
+                "badge": "1",
             },
             timeout=60.0,
         )
-
-        response_data = get_response_json(response)
-
-        if response_data["code"] != 200:
-            raise Exception(
-                f"Maybe the Bark sendkey is incorrect: ({response_data['code']}) {response_data['message']}"
+        data = get_response_json(response)
+        if data["code"] != 200:
+            raise RuntimeError(
+                f"Maybe the Bark sendkey is incorrect: ({data['code']}) {data['message']}"
             )
+
+
+class SafeNotifier:
+    def __init__(self, adapter: NotificationAdapter, logger: Logger) -> None:
+        self.adapter = adapter
+        self.logger = logger
+
+    def notify_message(self, title: str, content: str) -> bool:
+        if self.adapter.method == "none":
+            self.logger.warning(
+                f"Notification method is 'none', skipping notification: {title}"
+            )
+            self.logger.breathe()
+            return True
+        try:
+            self.adapter.send(title, content)
+        except Exception as error:
+            self.logger.error(
+                f"Failed to send the notification message by {self.adapter.method}: "
+                f"({error.__class__.__name__}) {error}"
+            )
+            self.logger.breathe()
+            return False
+        self.logger.info(
+            f"Sent a notification message by {self.adapter.method}: {title}"
+        )
+        self.logger.breathe()
+        return True
+
+
+def _build_adapter(
+    settings: NotificationSettings,
+    client: Client | None,
+) -> NotificationAdapter:
+    if settings.method == "none":
+        return NullNotificationAdapter()
+    if settings.method == "email":
+        if settings.email is None or settings.password is None:
+            raise ValueError("Email notification credentials are required")
+        return EmailNotificationAdapter(settings.email, settings.password)
+    if settings.sendkey is None:
+        raise ValueError(f"{settings.method} sendkey is required")
+    http_client = client or Client(settings.method)
+    adapter_types = {
+        "sc3": SC3NotificationAdapter,
+        "sct": SCTNotificationAdapter,
+        "bark": BarkNotificationAdapter,
+    }
+    try:
+        adapter_type = adapter_types[settings.method]
+    except KeyError as error:
+        raise ValueError(
+            f"Unsupported notification method: {settings.method}"
+        ) from error
+    return adapter_type(settings.sendkey, http_client)
+
+
+def create_notifier(
+    settings: NotificationSettings,
+    client: Client | None = None,
+    logger: Logger | None = None,
+) -> SafeNotifier:
+    return SafeNotifier(
+        _build_adapter(settings, client),
+        logger or Logger("notifier"),
+    )
+
+
+class Notifier(SafeNotifier):
+    """Compatibility facade; new code should use create_notifier()."""
+
+    def __init__(
+        self,
+        settings: NotificationSettings | None = None,
+        client: Client | None = None,
+        logger: Logger | None = None,
+    ) -> None:
+        settings = settings or load_settings(CONFIG_FILE).notification
+        super().__init__(
+            _build_adapter(settings, client),
+            logger or Logger("notifier"),
+        )

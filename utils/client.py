@@ -21,7 +21,6 @@ def get_response_json(resp: Response):
 
 
 class EpeAPIError(Exception):
-
     def __init__(self, method: str, path: str, code: int | None, message: str):
         self.method = method
         self.path = path
@@ -51,7 +50,6 @@ class TransportUnavailableError(Exception):
 
 
 class Client:
-
     def __init__(self, name: str):
         self.session = sessions.Session()
         self.session.headers.update(
@@ -60,7 +58,7 @@ class Client:
             }
         )
         self._logger = Logger(name)
-        self._logger.debug(f"Session initialized")
+        self._logger.debug("Session initialized")
         self._logger.breathe()
 
     def _log_json(self, data, level: int) -> None:
@@ -73,7 +71,9 @@ class Client:
                 elif isinstance(v, dict):
                     if level >= MAX_LOG_DEPTH:
                         keys = list(v.keys())
-                        sample_keys = ", ".join(str(key) for key in keys[:MAX_LOG_ITEMS])
+                        sample_keys = ", ".join(
+                            str(key) for key in keys[:MAX_LOG_ITEMS]
+                        )
                         suffix = ", ..." if len(keys) > MAX_LOG_ITEMS else ""
                         self._logger.debug(
                             f"{indent}{k}: Object({len(v)} keys"
@@ -111,7 +111,9 @@ class Client:
                     self._logger.debug(f"{indent}[{index}]: Array({len(item)})")
                     self._log_json(item, level + 1)
                 else:
-                    self._logger.debug(f"{indent}[{index}]: {format_log_value(index, item)}")
+                    self._logger.debug(
+                        f"{indent}[{index}]: {format_log_value(index, item)}"
+                    )
 
             if len(data) > MAX_LOG_ITEMS:
                 self._logger.debug(
@@ -167,9 +169,9 @@ class Client:
 
         try:
             resp_json = get_response_json(resp)
-            self._logger.debug(f"Response JSON:")
+            self._logger.debug("Response JSON:")
             self._log_json(resp_json, 1)
-        except Exception as e:
+        except Exception:
             resp_text = resp.text.strip()
             if resp_text.startswith("<!DOCTYPE"):
                 resp_text = "(HTML)"
@@ -178,7 +180,7 @@ class Client:
             )
         self._logger.breathe()
 
-        self._logger.debug(f"Session cookies:")
+        self._logger.debug("Session cookies:")
         for cookie in self.session.cookies:
             self._logger.debug(
                 f"  {cookie.name}: {format_log_value(cookie.name, cookie.value)} "
@@ -191,8 +193,8 @@ class Client:
     def get(
         self,
         url: str,
-        params: dict = {},
-        headers: dict = {},
+        params: dict | None = None,
+        headers: dict | None = None,
         timeout=10.0,
         allow_redirects=True,
         **kwargs,
@@ -201,8 +203,8 @@ class Client:
         return self._request(
             "GET",
             url,
-            params=params,
-            headers=headers,
+            params=params or {},
+            headers=headers or {},
             timeout=timeout,
             allow_redirects=allow_redirects,
             **kwargs,
@@ -211,8 +213,8 @@ class Client:
     def post(
         self,
         url: str,
-        data: dict = {},
-        headers: dict = {},
+        data: dict | None = None,
+        headers: dict | None = None,
         timeout=10.0,
         allow_redirects=True,
         **kwargs,
@@ -221,8 +223,8 @@ class Client:
         return self._request(
             "POST",
             url,
-            data=data,
-            headers=headers,
+            data=data or {},
+            headers=headers or {},
             timeout=timeout,
             allow_redirects=allow_redirects,
             **kwargs,
@@ -230,7 +232,6 @@ class Client:
 
 
 class EpeClient(Client):
-
     def __init__(self, name: str):
         super().__init__(name)
         self.cg_auth_token: Optional[str] = None  # Local storage: dataSix
@@ -291,8 +292,8 @@ class EpeClient(Client):
     def epe_get(
         self,
         url: str,
-        params: dict = {},
-        headers: dict = {},
+        params: dict | None = None,
+        headers: dict | None = None,
         timeout=10.0,
         allow_redirects=True,
         **kwargs,
@@ -301,8 +302,8 @@ class EpeClient(Client):
         return self._epe_request(
             "GET",
             url,
-            params=params,
-            headers=headers,
+            params=params or {},
+            headers=headers or {},
             timeout=timeout,
             allow_redirects=allow_redirects,
             **kwargs,
@@ -311,8 +312,8 @@ class EpeClient(Client):
     def epe_post(
         self,
         url: str,
-        data: dict = {},
-        headers: dict = {},
+        data: dict | None = None,
+        headers: dict | None = None,
         timeout=10.0,
         allow_redirects=True,
         **kwargs,
@@ -321,8 +322,8 @@ class EpeClient(Client):
         return self._epe_request(
             "POST",
             url,
-            data=data,
-            headers=headers,
+            data=data or {},
+            headers=headers or {},
             timeout=timeout,
             allow_redirects=allow_redirects,
             **kwargs,

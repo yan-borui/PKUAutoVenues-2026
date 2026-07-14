@@ -34,7 +34,7 @@ from .errors import (
     classify_attempt_failure,
 )
 from .logger import Logger
-from .recognize import Recognizer
+from .recognize import CaptchaRecognizer
 from .time import get_release_time, wait_until
 
 
@@ -319,7 +319,7 @@ class ReservationAttempt:
         self,
         request: ReservationRequest,
         gateway: EpeGateway,
-        recognizer: Recognizer,
+        recognizer: CaptchaRecognizer,
         logger: Logger,
         runtime: CampaignRuntime,
     ) -> None:

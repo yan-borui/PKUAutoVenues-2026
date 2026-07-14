@@ -1,22 +1,35 @@
 import unittest
 from unittest.mock import Mock
 
-from utils.recognize import Recognizer
+from utils.recognize import TTShituRecognizer
+from utils.settings import RecognitionSettings
+
+
+class FakeLogger:
+    def info(self, _message):
+        pass
+
+    def breathe(self):
+        pass
 
 
 class TTShituRecognitionTests(unittest.TestCase):
     def test_ttshitu_uses_one_short_request(self):
-        recognizer = object.__new__(Recognizer)
-        recognizer._client = Mock()
+        client = Mock()
+        recognizer = TTShituRecognizer(
+            RecognitionSettings("ttshitu", "user", "password"),
+            client,
+            FakeLogger(),
+        )
         response = Mock()
         response.json.return_value = {"data": {"result": "1,2"}}
-        recognizer._client.post.return_value = response
+        client.post.return_value = response
 
-        result = recognizer._ttshitu("image", ["字"])
+        result = recognizer.recognize_captcha("image", ["字"])
 
-        self.assertEqual(result, "1,2")
-        recognizer._client.post.assert_called_once()
-        _, kwargs = recognizer._client.post.call_args
+        self.assertEqual(result, [(1, 2)])
+        client.post.assert_called_once()
+        _, kwargs = client.post.call_args
         self.assertEqual(kwargs["timeout"], 2.0)
         self.assertEqual(kwargs["max_attempts"], 1)
 
