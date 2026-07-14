@@ -20,3 +20,6 @@ logs/
 
 # Local config
 config.ini
+
+# Local agent instructions
+AGENTS.md
