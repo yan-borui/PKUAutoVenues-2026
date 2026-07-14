@@ -215,13 +215,21 @@ class EpeGateway:
         )
         return parse_availability(data)
 
-    def issue_captcha(self, client_uid: str) -> CaptchaChallenge:
+    def issue_captcha(
+        self,
+        client_uid: str,
+        timestamp_ms: int | None = None,
+    ) -> CaptchaChallenge:
         data = self.client.epe_get(
             f"{EPE_BASE_URL}/api/captcha/get",
             params={
                 "captchaType": "clickWord",
                 "clientUid": client_uid,
-                "ts": str(int(time.time() * 1000)),
+                "ts": str(
+                    timestamp_ms
+                    if timestamp_ms is not None
+                    else int(time.time() * 1000)
+                ),
             },
         )
         if data.get("success") is not True:

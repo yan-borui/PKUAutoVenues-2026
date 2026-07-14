@@ -1,8 +1,13 @@
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from .logger import Logger
+
+
+def _shanghai_now() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Shanghai"))
 
 
 def get_next_weekday(weekday: int) -> str:
@@ -20,11 +25,19 @@ def get_release_time(target_date: str) -> datetime:
     return datetime(d.year, d.month, d.day, 12, 0, 0, tzinfo=tz) - timedelta(days=3)
 
 
-def wait_until(dt: datetime, logger: Logger, label: str, strict: bool):
+def wait_until(
+    dt: datetime,
+    logger: Logger,
+    label: str,
+    strict: bool,
+    *,
+    now: Callable[[], datetime] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
     """通过轮询，等待到 dt，若已过时就立刻返回"""
     while True:
-        now = datetime.now(ZoneInfo("Asia/Shanghai"))
-        remaining = (dt - now).total_seconds()
+        current_time = (now or _shanghai_now)()
+        remaining = (dt - current_time).total_seconds()
 
         if remaining <= 0:
             logger.info(f"Target time {dt.strftime('%Y-%m-%d %H:%M:%S')} reached!")
@@ -34,19 +47,19 @@ def wait_until(dt: datetime, logger: Logger, label: str, strict: bool):
 
         should_log = True
         if remaining > 100:
-            sleep = 30
+            sleep_seconds = 30
         elif remaining > 30:
-            sleep = 8
+            sleep_seconds = 8
         elif remaining > 10:
-            sleep = 2
+            sleep_seconds = 2
         elif remaining > 3 or not strict:
-            sleep = 1
+            sleep_seconds = 1
         else:
-            sleep = 0.1
+            sleep_seconds = 0.1
             should_log = False
 
         if should_log:
             logger.info(
                 f"Waiting for {dt.strftime('%H:%M:%S')} to start '{label}': {remaining:.2f}s remaining"
             )
-        time.sleep(sleep)
+        sleep(sleep_seconds)

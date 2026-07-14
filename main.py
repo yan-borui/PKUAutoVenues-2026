@@ -16,10 +16,20 @@ from utils.client import (
     EpeUnavailableError,
     TransportUnavailableError,
 )
+from utils.campaign import (
+    CampaignRuntime,
+    ReservationAttempt,
+    ReservationCampaign,
+    build_reservation_windows as _build_reservation_windows,
+    run_reservation_window as _run_reservation_window,
+    run_with_transport_recovery as _run_with_transport_recovery,
+    wait_for_epe as _wait_for_epe,
+)
 from utils.domain import (
     AvailabilitySnapshot,
     PreferredSpaces,
     ReservationKey,
+    ReservationRequest,
     ReservationResult,
     ReservationSelection,
     ReservationTrade,
@@ -467,6 +477,14 @@ def attempt_reservation(
     )
 
 
+# Compatibility exports for callers that historically imported scheduling helpers
+# from main.py. Their implementations now live with the campaign state they govern.
+build_reservation_windows = _build_reservation_windows
+run_reservation_window = _run_reservation_window
+run_with_transport_recovery = _run_with_transport_recovery
+wait_for_epe = _wait_for_epe
+
+
 def main(
     venues: list[str],
     target_date: str,
@@ -511,6 +529,28 @@ def main(
     gateway = EpeGateway(client, settings, logger)
     recognizer = Recognizer(settings.recognition)
     notifier = Notifier(settings.notification)
+    request = ReservationRequest(
+        venues=venues,
+        target_date=target_date,
+        target_times=target_times,
+        preferred_spaces=preferred_spaces,
+        retry_returned_slots=retry_returned_slots,
+    )
+    runtime = CampaignRuntime()
+    reservation_attempt = ReservationAttempt(
+        request=request,
+        gateway=gateway,
+        recognizer=recognizer,
+        logger=logger,
+        runtime=runtime,
+    )
+    campaign = ReservationCampaign(
+        request=request,
+        gateway=gateway,
+        attempt=reservation_attempt,
+        logger=logger,
+        runtime=runtime,
+    )
 
     try:
         """
@@ -519,7 +559,7 @@ def main(
 
         wait_until(login_time, logger, "login", strict=False)
 
-        windows = build_reservation_windows(release_time, retry_returned_slots)
+        windows = campaign.windows
         login_retry_until = windows[-1].start_at + timedelta(minutes=1)
         run_with_transport_recovery(
             action=gateway.authenticate,
@@ -532,54 +572,7 @@ def main(
         Loop: Recognize captcha, fetch reservation info, and submit order
         """
 
-        # A checked captcha can only be submitted once. Each release window gets
-        # an independent attempt budget.
-        client_point_uid = f"point-{generate_uuid()}"
-        reservation_result: ReservationResult | None = None
-        for window in windows:
-            wait_until(window.start_at, logger, window.label, strict=True)
-            logger.info(
-                f"Starting {window.label} with {window.max_attempts} attempt(s)"
-            )
-            logger.breathe()
-
-            # A rejected combination may become available again in a later window.
-            rejected_reservations: set[ReservationKey] = set()
-            reservation_result = run_reservation_window(
-                attempt=lambda: attempt_reservation(
-                    client=client,
-                    recognizer=recognizer,
-                    client_point_uid=client_point_uid,
-                    venues=venues,
-                    target_date=target_date,
-                    target_times=target_times,
-                    preferred_spaces=preferred_spaces,
-                    rejected_reservations=rejected_reservations,
-                    logger=logger,
-                    settings=settings,
-                ),
-                heartbeat=lambda: wait_for_epe(
-                    client=client,
-                    venue=venues[0],
-                    target_date=target_date,
-                    logger=logger,
-                ),
-                max_attempts=window.max_attempts,
-                logger=logger,
-            )
-            if reservation_result is not None:
-                break
-
-            logger.warning(f"No reservation completed in {window.label}")
-            logger.breathe()
-
-        if reservation_result is None:
-            total_attempts = sum(window.max_attempts for window in windows)
-            logger.error("All reservation windows exhausted, exiting")
-            raise Exception(
-                "Failed to find available spaces after "
-                f"{total_attempts} reservation attempts"
-            )
+        reservation_result = campaign.run()
 
         selected_venue = reservation_result.venue
         selected_space = reservation_result.space

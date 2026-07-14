@@ -7,6 +7,15 @@ PreferredSpaces = list[str] | dict[str, list[str]]
 
 
 @dataclass(frozen=True, slots=True)
+class ReservationRequest:
+    venues: list[str]
+    target_date: str
+    target_times: list[tuple[str, int]]
+    preferred_spaces: PreferredSpaces
+    retry_returned_slots: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ReservationSlot:
     id: str
     begin_time: str
