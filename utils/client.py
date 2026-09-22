@@ -131,17 +131,19 @@ class Client:
         retry_delay: float = 0.5,
         **kwargs,
     ) -> Response:
-        self._logger.debug(f"Sending request: {method} {url}")
+        debug_logging = self._logger.debug_enabled
+        if debug_logging:
+            self._logger.debug(f"Sending request: {method} {url}")
 
-        for key, value in kwargs.items():
-            if value is not None and value != {}:
-                if key in ["params", "data", "headers"]:
-                    self._logger.debug(f"  {key}:")
-                    for k, v in value.items():
-                        self._logger.debug(f"    {k}: {format_log_value(k, v)}")
-                elif not (key == "allow_redirects" and value is True):
-                    self._logger.debug(f"  {key}: {format_log_value(key, value)}")
-        self._logger.breathe()
+            for key, value in kwargs.items():
+                if value is not None and value != {}:
+                    if key in ["params", "data", "headers"]:
+                        self._logger.debug(f"  {key}:")
+                        for k, v in value.items():
+                            self._logger.debug(f"    {k}: {format_log_value(k, v)}")
+                    elif not (key == "allow_redirects" and value is True):
+                        self._logger.debug(f"  {key}: {format_log_value(key, value)}")
+            self._logger.breathe()
 
         last_error: Exception | None = None
         for attempt in range(1, max_attempts + 1):
@@ -165,28 +167,29 @@ class Client:
                 last_error,
             ) from last_error
 
-        self._logger.debug(f"Response status: {resp.status_code}")
+        if debug_logging:
+            self._logger.debug(f"Response status: {resp.status_code}")
 
-        try:
-            resp_json = get_response_json(resp)
-            self._logger.debug("Response JSON:")
-            self._log_json(resp_json, 1)
-        except Exception:
-            resp_text = resp.text.strip()
-            if resp_text.startswith("<!DOCTYPE"):
-                resp_text = "(HTML)"
-            self._logger.debug(
-                f"Response text: {resp_text[:400] + '...' if len(resp_text) > 400 else resp_text}"
-            )
-        self._logger.breathe()
+            try:
+                resp_json = get_response_json(resp)
+                self._logger.debug("Response JSON:")
+                self._log_json(resp_json, 1)
+            except Exception:
+                resp_text = resp.text.strip()
+                if resp_text.startswith("<!DOCTYPE"):
+                    resp_text = "(HTML)"
+                self._logger.debug(
+                    f"Response text: {resp_text[:400] + '...' if len(resp_text) > 400 else resp_text}"
+                )
+            self._logger.breathe()
 
-        self._logger.debug("Session cookies:")
-        for cookie in self.session.cookies:
-            self._logger.debug(
-                f"  {cookie.name}: {format_log_value(cookie.name, cookie.value)} "
-                f"(domain={cookie.domain}; path={cookie.path})"
-            )
-        self._logger.breathe()
+            self._logger.debug("Session cookies:")
+            for cookie in self.session.cookies:
+                self._logger.debug(
+                    f"  {cookie.name}: {format_log_value(cookie.name, cookie.value)} "
+                    f"(domain={cookie.domain}; path={cookie.path})"
+                )
+            self._logger.breathe()
 
         return resp
 

@@ -30,7 +30,7 @@ from utils.domain import (
     ReservationSelection,
 )
 from utils.epe import EpeGateway
-from utils.logger import Logger
+from utils.logger import Logger, configure_logging
 from utils.notify import create_notifier
 from utils.recognize import CaptchaRecognizer, create_recognizer
 from utils.settings import AppSettings, load_settings
@@ -54,6 +54,7 @@ __all__ = [
 class CliCommand:
     request: ReservationRequest
     skip_pay: bool
+    debug: bool = False
 
 
 def select_reservation(
@@ -145,7 +146,10 @@ def main(
     preferred_spaces: PreferredSpaces,
     skip_pay: bool,
     retry_returned_slots: bool,
+    *,
+    debug: bool = False,
 ) -> bool:
+    configure_logging(debug=debug)
     settings = load_settings(CONFIG_FILE)
     logger = Logger("main")
     logger.info(f"Running: {' '.join(sys.argv)}")
@@ -308,6 +312,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Disable returned-slot attempts at 12:11, 12:12, and 12:13",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Write detailed debug logs to file (console remains at INFO)",
+    )
     return parser
 
 
@@ -408,6 +417,7 @@ def parse_cli_args(argv: list[str] | None = None) -> CliCommand:
             retry_returned_slots=args.retry_returned_slots,
         ),
         skip_pay=args.skip_pay,
+        debug=args.debug,
     )
 
 
@@ -421,6 +431,7 @@ def run_cli(argv: list[str] | None = None) -> int:
         preferred_spaces=request.preferred_spaces,
         skip_pay=command.skip_pay,
         retry_returned_slots=request.retry_returned_slots,
+        debug=command.debug,
     )
     return 0 if succeeded else 1
 

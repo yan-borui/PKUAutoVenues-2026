@@ -55,11 +55,11 @@ def wait_until(
         elif remaining > 3 or not strict:
             sleep_seconds = 1
         else:
-            sleep_seconds = 0.1
+            sleep_seconds = 0.01 if remaining <= 0.1 else 0.1
             should_log = False
 
         if should_log:
             logger.info(
                 f"Waiting for {dt.strftime('%H:%M:%S')} to start '{label}': {remaining:.2f}s remaining"
             )
-        sleep(sleep_seconds)
+        sleep(min(sleep_seconds, remaining))

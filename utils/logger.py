@@ -6,6 +6,8 @@ from typing import Any
 from .config import LOG_FILE
 
 MAX_LOG_VALUE_LENGTH = 300
+_FILE_LOG_LEVEL = logging.INFO
+_MANAGED_LOGGERS: set[logging.Logger] = set()
 SENSITIVE_KEY_NAMES = {
     "authorization",
     "captchatoken",
@@ -78,15 +80,25 @@ def sanitize_log_message(msg: str) -> str:
     return msg
 
 
+def configure_logging(*, debug: bool = False) -> None:
+    global _FILE_LOG_LEVEL
+    _FILE_LOG_LEVEL = logging.DEBUG if debug else logging.INFO
+    for logger in _MANAGED_LOGGERS:
+        logger.setLevel(_FILE_LOG_LEVEL)
+        for handler in logger.handlers:
+            if isinstance(handler, logging.FileHandler):
+                handler.setLevel(_FILE_LOG_LEVEL)
+
+
 class Logger:
     def __init__(self, name: str):
         self._logger = logging.getLogger(name)
-        self._logger.setLevel(logging.DEBUG)
+        self._logger.setLevel(_FILE_LOG_LEVEL)
 
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
         formatter = logging.Formatter(
-            "%(asctime)s [%(levelname)s] (%(name)s) %(message)s",
+            "%(asctime)s.%(msecs)03d [%(levelname)s] (%(name)s) %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
 
@@ -101,8 +113,9 @@ class Logger:
         if self._file_handler is None:
             self._file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
             self._logger.addHandler(self._file_handler)
-        self._file_handler.setLevel(logging.DEBUG)
+        self._file_handler.setLevel(_FILE_LOG_LEVEL)
         self._file_handler.setFormatter(formatter)
+        _MANAGED_LOGGERS.add(self._logger)
 
     def _find_console_handler(self) -> logging.StreamHandler | None:
         for handler in self._logger.handlers:
@@ -124,8 +137,13 @@ class Logger:
                 return handler
         return None
 
+    @property
+    def debug_enabled(self) -> bool:
+        return self._logger.isEnabledFor(logging.DEBUG)
+
     def debug(self, msg: str) -> None:
-        self._logger.debug(sanitize_log_message(str(msg)))
+        if self.debug_enabled:
+            self._logger.debug(sanitize_log_message(str(msg)))
 
     def info(self, msg: str) -> None:
         self._logger.info(sanitize_log_message(str(msg)))
@@ -138,5 +156,6 @@ class Logger:
 
     def breathe(self) -> None:
         """Insert a blank line in the log file, see function `StreamHandler.emit`"""
-        self._file_handler.stream.write("\n")
-        self._file_handler.flush()
+        if self.debug_enabled:
+            self._file_handler.stream.write("\n")
+            self._file_handler.flush()

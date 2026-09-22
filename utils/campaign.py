@@ -2,8 +2,9 @@ import base64
 import json
 import random
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TypeVar
@@ -18,6 +19,7 @@ from .client import (
 from .config import LOGS_DIR
 from .domain import (
     AvailabilitySnapshot,
+    CaptchaChallenge,
     PreferredSpaces,
     ReservationKey,
     ReservationRequest,
@@ -40,6 +42,8 @@ from .time import get_release_time, wait_until
 
 MAX_CAPTCHA_TURNS = 8
 RETURNED_SLOT_OFFSETS_MINUTES = (11, 12, 13)
+# Shorter check-to-submit intervals caused EPE code 250 (验证码非法校验).
+MIN_CAPTCHA_SUBMIT_INTERVAL = 1.0
 AttemptResult = TypeVar("AttemptResult")
 
 
@@ -70,6 +74,23 @@ class ReservationWindow:
     start_at: datetime
     max_attempts: int
     label: str
+
+
+@dataclass(slots=True)
+class _AttemptTimings:
+    monotonic: Callable[[], float]
+    started_at: float
+    started_after_release_ms: float
+    stages_ms: dict[str, float] = field(default_factory=dict)
+    submit_after_release_ms: float | None = None
+
+    @contextmanager
+    def measure(self, stage: str) -> Iterator[None]:
+        started_at = self.monotonic()
+        try:
+            yield
+        finally:
+            self.stages_ms[stage] = (self.monotonic() - started_at) * 1000
 
 
 def select_reservation(
@@ -334,42 +355,98 @@ class ReservationAttempt:
         client_point_uid: str,
         rejected_reservations: set[ReservationKey],
     ) -> ReservationResult:
-        challenge = self.gateway.issue_captcha(
-            client_point_uid,
-            timestamp_ms=self.runtime.epoch_ms(),
+        started_wall_time = self.runtime.now()
+        timings = _AttemptTimings(
+            monotonic=self.runtime.monotonic,
+            started_at=self.runtime.monotonic(),
+            started_after_release_ms=(
+                started_wall_time - get_release_time(self.request.target_date)
+            ).total_seconds()
+            * 1000,
         )
-        image_path = self.runtime.save_captcha(
-            challenge.image_base64,
-            self.runtime.now(),
-        )
+        outcome = "interrupted"
+        try:
+            result = self._run(client_point_uid, rejected_reservations, timings)
+            outcome = "success"
+            return result
+        except Exception as error:
+            outcome = f"failed:{type(error).__name__}"
+            raise
+        finally:
+            total_ms = (self.runtime.monotonic() - timings.started_at) * 1000
+            fields = [
+                f"{stage}={elapsed:.1f}" for stage, elapsed in timings.stages_ms.items()
+            ]
+            fields.append(f"total={total_ms:.1f}")
+            if timings.submit_after_release_ms is not None:
+                fields.append(
+                    f"submit_after_release={timings.submit_after_release_ms:.1f}"
+                )
+            self.logger.info(
+                f"Attempt timing (ms): outcome={outcome}; {'; '.join(fields)}"
+            )
+
+    def _archive_captcha(
+        self,
+        challenge: CaptchaChallenge,
+        issued_at: datetime,
+        timings: _AttemptTimings,
+    ) -> None:
+        with timings.measure("captcha_save"):
+            image_path = self.runtime.save_captcha(challenge.image_base64, issued_at)
         self.logger.info(f"Captcha image saved to: {image_path}")
+
+    def _run(
+        self,
+        client_point_uid: str,
+        rejected_reservations: set[ReservationKey],
+        timings: _AttemptTimings,
+    ) -> ReservationResult:
+        with timings.measure("captcha_get"):
+            challenge = self.gateway.issue_captcha(
+                client_point_uid,
+                timestamp_ms=self.runtime.epoch_ms(),
+            )
+        issued_at = self.runtime.now()
         self.logger.info(f"Words to click: {challenge.words}")
         self.logger.debug(f"Captcha token: {challenge.token}")
         self.logger.debug(f"Captcha secret key: {challenge.secret_key}")
         self.logger.breathe()
 
-        recognize_result = self.recognizer.recognize_captcha(
-            challenge.image_base64, challenge.words
-        )
-        recognized_points = json.dumps(
-            [{"x": x, "y": y} for x, y in recognize_result],
-            separators=(",", ":"),
-        )
-        self.gateway.verify_captcha(challenge, recognized_points)
-        captcha_verified_at = self.runtime.monotonic()
+        try:
+            with timings.measure("recognize"):
+                recognize_result = self.recognizer.recognize_captcha(
+                    challenge.image_base64, challenge.words
+                )
+                recognized_points = json.dumps(
+                    [{"x": x, "y": y} for x, y in recognize_result],
+                    separators=(",", ":"),
+                )
+            with timings.measure("captcha_check"):
+                self.gateway.verify_captcha(challenge, recognized_points)
+                captcha_verified_at = self.runtime.monotonic()
+        except Exception:
+            try:
+                self._archive_captcha(challenge, issued_at, timings)
+            except Exception as save_error:
+                self.logger.warning(f"Failed to save captcha image: {save_error}")
+            raise
+
+        self._archive_captcha(challenge, issued_at, timings)
         self.logger.info("Captcha verified successfully!")
         self.logger.breathe()
 
-        selection = find_reservation(
-            client=self.gateway,
-            venues=self.request.venues,
-            target_date=self.request.target_date,
-            target_times=self.request.target_times,
-            preferred_spaces=self.request.preferred_spaces,
-            rejected_reservations=rejected_reservations,
-            logger=self.logger,
-            chooser=self.runtime.choose,
-        )
+        with timings.measure("availability"):
+            selection = find_reservation(
+                client=self.gateway,
+                venues=self.request.venues,
+                target_date=self.request.target_date,
+                target_times=self.request.target_times,
+                preferred_spaces=self.request.preferred_spaces,
+                rejected_reservations=rejected_reservations,
+                logger=self.logger,
+                chooser=self.runtime.choose,
+            )
         if selection is None:
             self.logger.breathe()
             raise NoCandidateError(
@@ -385,19 +462,27 @@ class ReservationAttempt:
             self.logger.debug(f"  - {trade}")
         self.logger.breathe()
 
-        elapsed = self.runtime.monotonic() - captcha_verified_at
-        if elapsed < 1:
-            self.logger.info(f"Sleep for {1 - elapsed:.2f} seconds...")
-            self.logger.breathe()
-            self.runtime.sleep(1 - elapsed)
+        # Saving the image and fetching availability share the required interval.
+        submit_not_before = captcha_verified_at + MIN_CAPTCHA_SUBMIT_INTERVAL
+        with timings.measure("captcha_wait"):
+            while True:
+                remaining = submit_not_before - self.runtime.monotonic()
+                if remaining <= 0:
+                    break
+                self.runtime.sleep(remaining)
 
         try:
-            order = self.gateway.submit_order(
-                selection=selection,
-                target_date=self.request.target_date,
-                points_json=recognized_points,
-                challenge=challenge,
-            )
+            with timings.measure("submit"):
+                timings.submit_after_release_ms = (
+                    timings.started_after_release_ms
+                    + (self.runtime.monotonic() - timings.started_at) * 1000
+                )
+                order = self.gateway.submit_order(
+                    selection=selection,
+                    target_date=self.request.target_date,
+                    points_json=recognized_points,
+                    challenge=challenge,
+                )
         except Exception as submit_error:
             if (
                 isinstance(submit_error, EpeAPIError)
@@ -415,30 +500,31 @@ class ReservationAttempt:
                 f"Reservation submit result is uncertain: {submit_error}"
             )
             self.logger.info("Checking for a matching unpaid order...")
-            while True:
-                try:
-                    order = self.gateway.find_unpaid_order(
-                        venue=selection.venue,
-                        target_date=self.request.target_date,
-                        selected_space=selection.space,
-                        begin_time=selection.trades[0].begin_time,
-                    )
-                    if order is None and "未支付的订单" in str(submit_error):
+            with timings.measure("order_recovery"):
+                while True:
+                    try:
                         order = self.gateway.find_unpaid_order(
                             venue=selection.venue,
                             target_date=self.request.target_date,
-                            selected_space=None,
+                            selected_space=selection.space,
                             begin_time=selection.trades[0].begin_time,
                         )
-                    break
-                except (EpeUnavailableError, TransportUnavailableError):
-                    wait_for_epe(
-                        client=self.gateway.client,
-                        venue=selection.venue,
-                        target_date=self.request.target_date,
-                        logger=self.logger,
-                        sleep=self.runtime.sleep,
-                    )
+                        if order is None and "未支付的订单" in str(submit_error):
+                            order = self.gateway.find_unpaid_order(
+                                venue=selection.venue,
+                                target_date=self.request.target_date,
+                                selected_space=None,
+                                begin_time=selection.trades[0].begin_time,
+                            )
+                        break
+                    except (EpeUnavailableError, TransportUnavailableError):
+                        wait_for_epe(
+                            client=self.gateway.client,
+                            venue=selection.venue,
+                            target_date=self.request.target_date,
+                            logger=self.logger,
+                            sleep=self.runtime.sleep,
+                        )
             if order is None:
                 raise submit_error
 
@@ -494,6 +580,7 @@ class ReservationCampaign:
     def run(self) -> ReservationResult:
         client_point_uid = f"point-{self.runtime.make_uid()}"
         for window in self.windows:
+            # Pre-release captchas were invalidated at 12:00 (EPE code 250).
             wait_until(
                 window.start_at,
                 self.logger,
